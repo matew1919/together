@@ -16,10 +16,10 @@ export function setPlayback(room,phase,position,now=Date.now()) {
   };
 }
 
-export function watchReady(playback,watch,now=Date.now()) {
+export function watchReady(playback,watch,now=Date.now(),growing=false) {
   if(watch?.sequence!==playback.sequence||now-watch.at>WATCH_TIMEOUT_MS||watch.waiting||watch.blocked||!watch.paused)return false;
   if(Math.abs(watch.position-playback.position)>0.4)return false;
-  const remaining=Math.max(0,watch.duration-playback.position);
+  const remaining=growing?Infinity:Math.max(0,watch.duration-playback.position);
   return watch.position+watch.bufferAhead-playback.position>=Math.min(MIN_BUFFER,remaining)-0.2;
 }
 
@@ -27,7 +27,7 @@ export function updateGroupPlayback(room,now=Date.now()) {
   const playback=room.playback;
   const members=[...room.members.values()].filter(member=>member.present||member.stream);
   if(playback.phase==='buffering'&&members.length&&room.members.get(room.host)?.stream) {
-    const ready=members.every(({stream,watch})=>stream&&watchReady(playback,watch,now));
+    const ready=members.every(({stream,watch})=>stream&&watchReady(playback,watch,now,room.video?.growing));
     if(ready){setPlayback(room,'playing',playback.position,now);return true;}
   }
   if(playback.phase==='playing') {
@@ -35,7 +35,7 @@ export function updateGroupPlayback(room,now=Date.now()) {
       !stream||now>=playback.at+STALL_GRACE_MS&&(
         !watch||now-watch.at>WATCH_TIMEOUT_MS||
         watch.sequence===playback.sequence&&(watch.blocked||watch.waiting||
-          (watch.paused||watch.bufferAhead<LOW_BUFFER)&&watch.duration-watch.position>1)
+          (watch.paused||watch.bufferAhead<LOW_BUFFER)&&(room.video?.growing||watch.duration-watch.position>1))
       )
     );
     if(stalled.length) {

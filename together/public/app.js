@@ -11,6 +11,7 @@ let streamPlayer=null,streamCatalog=null,currentStream=null,playedVersion,qualit
 const screenCards=new Map();
 let displayCapture=null,callView=false,focusedTile=null,callMuted=false;
 let micTestUrl,micTestTrack;
+let participantsOpen=false,expandedScreen=null,screenReturn=null;
 let libraryBusy=false,fullscreenTimer,hlsLoading=false,hlsUnavailable=false;
 const libraryKey=getLibraryKey();
 const playbackIntent=()=>!!room&&room.playback.phase!=='paused';
@@ -57,7 +58,8 @@ function mediaUrl(action) {
 function originalVideoUrl(){return mediaUrl('video')+'&v='+encodeURIComponent(version);}
 function showQualities(catalog) {
   const select=$('quality'),chosen=qualityPreference;
-  select.replaceChildren(new Option('Авто','auto'),new Option('Оригинал','original'));
+  select.replaceChildren(new Option('Авто','auto'));
+  if(!room?.video?.live)select.append(new Option('Оригинал','original'));
   for(const variant of catalog?.variants||[]) {
     if(variant.id==='source')continue;
     const status=variant.ready?'':variant.failed?' · недоступно':variant.requested?' · готовится':' · по запросу';
@@ -96,6 +98,7 @@ function changeSource(target,url,hlsSource) {
   let recoveries=0;
   const fallback=()=>{
     if(streamPlayer!==hls||!version)return;
+    if(room?.video?.live){retryMedia();return;}
     toast('Не удалось открыть поток. Загружаю исходный файл.');
     qualityPreference='original';
     showQualities(streamCatalog);
@@ -140,6 +143,7 @@ function loadHls() {
 }
 async function useQuality(choice,automatic=false) {
   if(!session||!version)return;
+  if(room?.video?.live&&choice==='original')choice='auto';
   const ready=(streamCatalog?.variants||[]).filter(variant=>variant.ready);
   const optimized=ready.filter(variant=>variant.id!=='source'&&variant.height<=720);
   const variants=choice==='original'?[]:choice==='auto'?(optimized.length?optimized:ready):ready.filter(variant=>variant.id===choice);
@@ -152,7 +156,7 @@ async function useQuality(choice,automatic=false) {
   }
   if(variants.length&&(window.MediaSource||window.ManagedMediaSource)&&typeof Hls==='undefined'&&!hlsUnavailable) {
     loadHls();
-    if(!currentStream)changeSource('original',originalVideoUrl(),false);
+    if(!currentStream&&!room.video.live)changeSource('original',originalVideoUrl(),false);
     return;
   }
   const canHls=(typeof Hls!=='undefined'&&Hls.isSupported())||movie.canPlayType('application/vnd.apple.mpegurl');
@@ -167,11 +171,17 @@ async function useQuality(choice,automatic=false) {
     const manifest=choice==='auto'&&typeof Hls!=='undefined'&&Hls.isSupported()?
       'master.m3u8':variants[0].id+'/index.m3u8';
     changeSource(target,mediaUrl(base+manifest),true);
-  } else changeSource(target,originalVideoUrl(),false);
+  } else if(!room.video.live)changeSource(target,originalVideoUrl(),false);
+  else if(variants.length){sourceFailed=true;toast('Для этого потока нужен браузер с поддержкой HLS.');}
 }
 function applyCatalog(catalog,initial=false) {
   if(catalog.version!==version||(catalog.revision||0)<(streamCatalog?.revision||0))return;
   streamCatalog=catalog;
+  if(catalog.live){
+    room.video.growing=catalog.growing;
+    sourceFailed=catalog.status==='failed';
+    $('movie-detail').textContent=catalog.growing?'Файл ещё скачивается · 360p':'Скачивание завершено · 360p';
+  }
   showQualities(catalog);
   if(initial||currentStream||catalog.variants.some(variant=>variant.ready))useQuality(qualityPreference,true);
   if(sourceFailed&&catalog.status==='failed')toast('Браузер не смог открыть видео. Попробуй MP4 (H.264 + AAC) или WebM.');
@@ -219,11 +229,12 @@ function updateBufferDisplay() {
   const ahead=bufferedAhead(movie);
   $('buffer-health').textContent=version?'Загружено вперёд: '+time(ahead)+(streamPlayer?.bandwidthEstimate?' · '+(streamPlayer.bandwidthEstimate/1000000).toFixed(1)+' Мбит/с':''):'';
   const track=$('buffered-track');
+  const duration=Number.isFinite(movie.duration)?movie.duration:streamCatalog?.duration||0;
   track.replaceChildren();
-  if(Number.isFinite(movie.duration)&&movie.duration>0)for(let i=0;i<movie.buffered.length;i++) {
+  if(duration>0)for(let i=0;i<movie.buffered.length;i++) {
     const segment=document.createElement('span');
-    segment.style.left=(movie.buffered.start(i)/movie.duration*100)+'%';
-    segment.style.width=((movie.buffered.end(i)-movie.buffered.start(i))/movie.duration*100)+'%';
+    segment.style.left=(movie.buffered.start(i)/duration*100)+'%';
+    segment.style.width=((movie.buffered.end(i)-movie.buffered.start(i))/duration*100)+'%';
     track.append(segment);
   }
   const phase=room?.playback.phase;
@@ -234,7 +245,7 @@ function updateBufferDisplay() {
   $('buffer-overlay').hidden=!version||needsClick||(!group&&!localWaiting&&!sourceFailed);
   if(sourceFailed) {
     $('buffer-message').textContent=streamCatalog?.status==='failed'?'Не удалось открыть видео':'Готовим поток для этого файла…';
-    $('buffer-description').textContent=streamCatalog?.status==='failed'?'Выбери другое качество или файл MP4 (H.264 + AAC).':'';
+    $('buffer-description').textContent=streamCatalog?.status==='failed'?(streamCatalog.error||'Выбери другое качество или файл MP4 (H.264 + AAC).'):'';
   } else if(group) {
     const waiting=bufferWaiters();
     $('buffer-message').textContent=waiting.length?'Ждём: '+waiting.join(', '):'Готово. Скоро продолжим…';
@@ -295,7 +306,7 @@ function writePlayback(action,position,sequence) {
 }
 function requestPlayPause() {
   if(playbackIntent())writePlayback('pause');
-  else writePlayback('play',movie.ended||movie.currentTime>=movie.duration-0.08?0:undefined);
+  else writePlayback('play',!room.video?.growing&&(movie.ended||movie.currentTime>=movie.duration-0.08)?0:undefined);
 }
 function seekTo(position) {
   if(!host()||!version||!connected||!Number.isFinite(position))return;
@@ -383,7 +394,48 @@ function state(next) {
   for(const [key,peer]of peers)if(!ids.has(key)){peer.pc.close();peers.delete(key);watchPositions.delete(key);const tile=screenCards.get(key);if(tile){screenCards.delete(key);removeTile(tile);}}
   for(const member of room.members)if(member.id!==session.id&&!peers.has(member.id))makePeer(member.id);
 }
+function setParticipantsOpen(open) {
+  participantsOpen=!!open;
+  $('participants-drawer').hidden=callView||!participantsOpen;
+  $('participants-toggle').setAttribute('aria-expanded',String(!callView&&participantsOpen));
+  $('participants-toggle-label').textContent=participantsOpen?'↓ Скрыть участников':'↑ Участники';
+  $('player').classList.toggle('participants-open',participantsOpen&&!callView);
+  if(typeof showFullscreenControls==='function')showFullscreenControls();
+}
+function refreshParticipantDrawer() {
+  const target=callView?$('call-tiles'):$('participants-tiles');
+  if($('people').parentElement!==target)target.append($('people'));
+  $('participants-count').textContent=room?.members.length||0;
+  $('participants-toggle').disabled=!session;
+  setParticipantsOpen(participantsOpen);
+}
+function closeScreenFullscreen() {
+  const tile=expandedScreen;
+  if(!tile)return;
+  if(tile.classList.contains('screen-fullscreen-fallback')) {
+    tile.classList.remove('screen-fullscreen-fallback');
+    const parent=screenReturn?.parent?.isConnected?screenReturn.parent:$('people');
+    const next=screenReturn?.next;
+    parent.insertBefore(tile,next?.parentElement===parent?next:null);
+  }
+  if(document.fullscreenElement===tile)document.exitFullscreen().catch(()=>{});
+  tile.querySelector('.screen-expand')?.setAttribute('aria-label','Развернуть демонстрацию на весь экран');
+  expandedScreen=null;screenReturn=null;
+}
+async function openScreenFullscreen(tile) {
+  if(expandedScreen===tile){closeScreenFullscreen();return;}
+  closeScreenFullscreen();expandedScreen=tile;
+  try {await tile.requestFullscreen();}
+  catch {
+    if(document.fullscreenElement)await document.exitFullscreen().catch(()=>{});
+    if(expandedScreen!==tile||!tile.isConnected)return;
+    screenReturn={parent:tile.parentElement,next:tile.nextSibling};
+    document.body.append(tile);tile.classList.add('screen-fullscreen-fallback');
+  }
+  tile.querySelector('.screen-expand')?.setAttribute('aria-label','Свернуть демонстрацию');
+}
 function renderCallLayout() {
+  refreshParticipantDrawer();
   const tiles=$('people');
   tiles.classList.toggle('is-focused',callView&&!!focusedTile);
   const self=cards.get(session?.id);
@@ -402,7 +454,8 @@ function setCallView(on) {
   callView=on;
   $('cinema').hidden=on;
   $('call-stage').hidden=!on;
-  (on?$('call-tiles'):$('sidebar-tiles')).append($('people'));
+  (on?$('call-tiles'):$('participants-tiles')).append($('people'));
+  setParticipantsOpen(participantsOpen);
   $('movie-mode').setAttribute('aria-pressed',String(!on));
   $('call-mode').setAttribute('aria-pressed',String(on));
   renderCallLayout();
@@ -421,6 +474,7 @@ function addFocusButton(tile,label) {
   tile.append(button);
 }
 function removeTile(tile) {
+  if(expandedScreen===tile)closeScreenFullscreen();
   if(focusedTile===tile)focusedTile=null;
   tile.remove();
   renderCallLayout();
@@ -441,6 +495,11 @@ function attachScreen(id,stream) {
     label.className='screen-name';label.textContent='Экран · '+name;
     tile.append(video,label);
     addFocusButton(tile,'Показать экран участника '+name);
+    const expand=document.createElement('button');expand.type='button';expand.className='screen-expand';expand.textContent='⛶';expand.setAttribute('aria-label','Развернуть демонстрацию на весь экран');
+    expand.onclick=event=>{event.stopPropagation();openScreenFullscreen(tile);};
+    const collapse=document.createElement('button');collapse.type='button';collapse.className='screen-collapse button';collapse.textContent='Свернуть ⛶';collapse.onclick=()=>closeScreenFullscreen();
+    tile.append(expand,collapse);video.ondblclick=()=>openScreenFullscreen(tile);
+
     screenCards.set(id,tile);
     $('people').append(tile);
   }
@@ -578,10 +637,10 @@ async function shareWatchPosition() {
   watchTimer=null;
   if(!session||!version||!connected)return;
   watchBusy=true;
-  const duration=Number.isFinite(movie.duration)?movie.duration:0;
+  const duration=Number.isFinite(movie.duration)?movie.duration:streamCatalog?.duration||0;
   const watch={
     version,sequence:room.playback.sequence,position:movie.currentTime||0,duration,
-    paused:movie.paused,waiting:!duration||sourceLoading||sourceFailed||unlocking||movie.seeking||(!movie.ended&&(mediaWaiting||movie.readyState<3)),
+    paused:movie.paused,waiting:!!(room.video.growing&&movie.ended)||!duration||sourceLoading||sourceFailed||unlocking||movie.seeking||(!movie.ended&&(mediaWaiting||movie.readyState<3)),
     blocked:autoplayBlocked,bufferAhead:bufferedAhead(movie)
   };
   const current=session;
@@ -614,8 +673,8 @@ async function leaveRoom() {
   clearTimeout(startTimer);clearTimeout(watchTimer);watchTimer=null;watchAgain=false;
   for(const peer of peers.values())peer.pc.close();peers.clear();
   if(displayCapture){for(const track of displayCapture.getTracks())track.stop();displayCapture=null;}
-  for(const tile of screenCards.values())tile.remove();
-  screenCards.clear();focusedTile=null;
+  closeScreenFullscreen();
+  for(const tile of screenCards.values())tile.remove();screenCards.clear();focusedTile=null;participantsOpen=false;
   setCallView(false);setCallMuted(false);updateScreenButton();
   for(const track of media.getTracks()){track.stop();media.removeTrack(track);}
   destroyStreamPlayer();streamCatalog=null;currentStream=null;sourceLoading=false;sourceFailed=false;movie.pause();movie.removeAttribute('src');movie.load();
@@ -1043,6 +1102,7 @@ function fileSize(bytes) {
   return bytes>=1024**3?(bytes/1024**3).toFixed(1)+' ГБ':Math.max(1,Math.round(bytes/1024**2))+' МБ';
 }
 async function openLibrary() {
+  $('local-source-help').hidden=!config?.localSourceOwner;
   if(!host()||!connected||upload||libraryBusy)return;
   const current=session,list=$('library-list'),dialog=$('library');
   list.replaceChildren();
@@ -1158,12 +1218,13 @@ window.addEventListener('pointerup',()=>setTimeout(stopScrubbing,0));
 
 const timeline=$('seek').parentElement,seekPreview=$('seek-preview');
 timeline.addEventListener('pointermove',event=>{
-  if(!version||!Number.isFinite(movie.duration)||movie.duration<=0)return;
+  const duration=Number.isFinite(movie.duration)?movie.duration:streamCatalog?.duration||0;
+  if(!version||duration<=0)return;
   const {left,width}=timeline.getBoundingClientRect();
   if(width<=15)return;
   const offset=Math.max(0,Math.min(width,event.clientX-left));
   const ratio=Math.max(0,Math.min(1,(offset-7.5)/(width-15)));
-  seekPreview.textContent=time(ratio*movie.duration);
+  seekPreview.textContent=time(ratio*duration);
   seekPreview.style.left=Math.max(25,Math.min(width-25,offset))+'px';
   seekPreview.hidden=false;
 });
@@ -1189,6 +1250,7 @@ movie.addEventListener('error',()=>{
 });
 movie.addEventListener('loadeddata',()=>{mediaRetryCount=0;});
 movie.addEventListener('ended',()=>{
+  if(room?.video?.growing){mediaWaiting=true;scheduleWatch();return;}
   if(movie.ended&&!pendingSeek&&room?.playback.phase==='playing')writePlayback('ended',movie.duration,room.playback.sequence);
   scheduleWatch();
 });
@@ -1223,7 +1285,7 @@ $('quality').onchange=()=>{qualityPreference=$('quality').value;useQuality(quali
 const player=$('player'),controls=player.querySelector('.controls');
 function fullscreen(){return document.fullscreenElement===player||player.classList.contains('fullscreen-fallback');}
 function hideFullscreenControls() {
-  if(!fullscreen()||isScrubbing||controls.querySelector(':focus-visible'))return;
+  if(!fullscreen()||isScrubbing||participantsOpen||controls.querySelector(':focus-visible'))return;
   player.classList.add('idle-controls');
   seekPreview.hidden=true;
 }
@@ -1252,7 +1314,14 @@ $('fullscreen').onclick=async()=>{
     fullscreenChanged();
   }
 };
-document.addEventListener('fullscreenchange',fullscreenChanged);
+document.addEventListener('fullscreenchange',()=>{
+  if(expandedScreen&&!expandedScreen.classList.contains('screen-fullscreen-fallback')&&document.fullscreenElement!==expandedScreen){expandedScreen.querySelector('.screen-expand')?.setAttribute('aria-label','Развернуть демонстрацию на весь экран');expandedScreen=null;screenReturn=null;}
+  fullscreenChanged();
+});
+$('participants-toggle').onclick=()=>setParticipantsOpen(!participantsOpen);
+$('participants-close').onclick=()=>setParticipantsOpen(false);
+window.addEventListener('keydown',event=>{if(event.key==='Escape'&&expandedScreen?.classList.contains('screen-fullscreen-fallback'))closeScreenFullscreen();});
+
 player.addEventListener('pointermove',event=>{
   if(!fullscreen()||event.pointerType==='touch')return;
   const bottom=player.getBoundingClientRect().bottom;

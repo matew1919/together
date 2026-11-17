@@ -1,7 +1,7 @@
 FROM node:22-alpine
 RUN apk add --no-cache ffmpeg
 WORKDIR /app
-COPY --chown=node:node package.json server.mjs ice-config.mjs video-streams.mjs video-library.mjs playback.mjs ./
+COPY --chown=node:node package.json server.mjs ice-config.mjs video-streams.mjs video-library.mjs playback.mjs growing-file.mjs live-source.mjs local-source-control.mjs stream-local.mjs ./
 COPY --chown=node:node public ./public
 RUN mkdir /app/.data && chown node:node /app/.data
 USER node

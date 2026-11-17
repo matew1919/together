@@ -8,6 +8,12 @@ import {promisify} from 'node:util';
 import path from 'node:path';
 import {createApp} from './server.mjs';
 
+function openBrowser(url) {
+  if(!process.argv.includes('--open'))return;
+  const command=process.platform==='darwin'?'open':process.platform==='linux'?'xdg-open':null;
+  if(!command)return;
+  spawn(command,[url],{stdio:'ignore'}).on('error',()=>console.warn('Открой адрес в браузере вручную: '+url));
+}
 const data=path.resolve(process.env.DATA_DIR||fileURLToPath(new URL('.data',import.meta.url)));
 const port=Number(process.env.PORT||3000);
 const host='127.0.0.1';
@@ -25,9 +31,7 @@ try {
     .then(response=>response.ok?response.json():null).catch(()=>null);
   if(existing?.sharing===true) {
     console.log('Together уже запущен → '+localUrl+'\nДля обновления останови сервер в его окне через Ctrl+C и запусти снова.');
-    if(process.platform==='darwin'&&process.argv.includes('--open')) {
-      spawn('open',[localUrl],{stdio:'ignore'}).on('error',()=>{});
-    }
+    openBrowser(localUrl);
     process.exitCode=0;
   } else {
     console.error('Порт '+port+' занят другим процессом. Освободи его или запусти Together с другим PORT.');
@@ -117,10 +121,7 @@ async function start() {
     process.once('SIGTERM',stop);
     const localUrl='http://'+host+':'+server.address().port;
     console.log('На этом компьютере → '+localUrl);
-    if(process.platform==='darwin'&&process.argv.includes('--open')) {
-      const browser=spawn('open',[localUrl],{stdio:'ignore'});
-      browser.on('error',()=>console.warn('Открой локальный адрес в браузере вручную.'));
-    }
+    openBrowser(localUrl);
     console.log('Открываю публичную HTTPS-ссылку…');
     connect();
   } catch(error) {

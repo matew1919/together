@@ -1,4 +1,6 @@
 import http from 'node:http';
+import {createLiveSources} from './live-source.mjs';
+import {localSourceControl} from './local-source-control.mjs';
 import {getIceConfig} from './ice-config.mjs';
 import {prepareStreams,describeStreams,streamAsset,authenticatedPlaylist} from './video-streams.mjs';
 import {createHash, randomBytes} from 'node:crypto';
@@ -27,7 +29,7 @@ async function body(req) {
 const roster=room=>[...room.members.values()].map(({id,name,stream,present})=>({id,name,present:!!present,online:!!stream}));
 function snapshot(room) {
   const video=room.video;
-  return {host:room.host,members:roster(room),video:video&&{name:video.name,version:video.version,size:video.size},playback:room.playback,messages:room.messages};
+  return {host:room.host,members:roster(room),video:video&&{name:video.name,version:video.version,size:video.size,live:!!video.liveId,growing:!!video.growing},playback:room.playback,messages:room.messages};
 }
 function send(member,type,value) {
   member.stream?.write(`event: ${type}\ndata: ${JSON.stringify(value)}\n\n`);
@@ -47,6 +49,8 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
   const data=path.resolve(process.env.DATA_DIR||path.join(root,'.data'));
   const maxBytes=Number(process.env.MAX_VIDEO_GB||8)*1024**3;
   const library=await openVideoLibrary(data);
+  const live=createLiveSources(path.join(data,'live'),{maxBytes});
+  const describeVideo=video=>video.liveId?live.describe(video):describeStreams(video);
   const rooms=new Map();
   const logs=path.join(data,'logs');
   mkdirSync(logs,{recursive:true,mode:0o700});
@@ -67,7 +71,7 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
     const now=Date.now();
     const saved=[...rooms.values()].map(room=>({
       id:room.id,host:room.host,
-      video:room.video&&{assetId:room.video.assetId,version:room.video.version,name:room.video.name},
+      video:room.video&&{assetId:room.video.assetId,liveId:room.video.liveId,version:room.video.version,name:room.video.name},
       playback:{...room.playback,position:playbackPosition(room.playback,now),at:now},
       messages:room.messages,touched:room.touched,
       members:[...room.members.values()].map(({id,token,name})=>({id,token,name}))
@@ -127,6 +131,7 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
     return {room,member};
   }
   function ensureStreams(video,quality=null) {
+    if(video.liveId)return;
     prepareStreams(video,media=>{
       for(const room of rooms.values()) {
         if(room.video?.path===video.path)broadcast(room,'media',{...media,version:room.video.version});
@@ -134,6 +139,7 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
     },quality);
   }
   function selectVideo(room,video) {
+    if(room.video?.liveId)live.stop(room.video.liveId);
     room.video={...video,version:id(9)};
     setPlayback(room,'paused',0);
     state(room);
@@ -144,7 +150,7 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
     const saved=JSON.parse(readFileSync(path.join(data,'rooms.json'),'utf8'));
     for(const item of saved.rooms||[]) {
       if(!/^[\w-]+$/.test(item.id))continue;
-      const file=item.video&&library.restore(item.video);
+      const file=item.video?.liveId?await live.restore(item.video.liveId):item.video&&library.restore(item.video);
       if(Date.now()-item.touched>86400000)continue;
       const video=file?{...file,version:item.video.version}:null;
       const room={...item,video,members:new Map(),uploading:false};
@@ -178,7 +184,7 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
       if (req.headers.origin && req.headers.origin !== `http://${req.headers.host}` && req.headers.origin !== `https://${req.headers.host}` && req.headers.origin !== publicOrigin()) throw new Fault(403,'Чужой источник запроса');
       if(req.method==='GET'&&url.pathname==='/api/time')return json(res,200,{now:Date.now()});
       if(req.method==='GET'&&url.pathname==='/api/address')return json(res,200,{url:publicOrigin(),sharing});
-      if (req.method === 'GET' && url.pathname === '/api/config') return json(res,200,{...await getIceConfig(data),maxBytes,maxMembers:8});
+      if (req.method === 'GET' && url.pathname === '/api/config') return json(res,200,{...await getIceConfig(data),maxBytes,maxMembers:8,localSourceOwner:libraryViewer(req).local});
       if (req.method === 'POST' && url.pathname === '/api/rooms') {
         if (rooms.size >= 100) throw new Fault(503,'Слишком много комнат');
         const input = await body(req);
@@ -190,7 +196,7 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
       if(masterMatch&&req.method==='GET'){
         const {room}=authorize(req,url);const video=room.video;if(!video||video.version!==masterMatch[2])throw new Fault(404,'Видео изменилось');
         ensureStreams(video);
-        const readyVariants=describeStreams(video).variants.filter(variant=>variant.ready);const optimized=readyVariants.filter(variant=>variant.id!=='source'&&variant.height<=720);const variants=(optimized.length?optimized:readyVariants).sort((a,b)=>a.height-b.height);if(!variants.length)throw new Fault(409,'Поток ещё готовится');
+        const readyVariants=describeVideo(video).variants.filter(variant=>variant.ready);const optimized=readyVariants.filter(variant=>variant.id!=='source'&&variant.height<=720);const variants=(optimized.length?optimized:readyVariants).sort((a,b)=>a.height-b.height);if(!variants.length)throw new Fault(409,'Поток ещё готовится');
         const token=req.headers.authorization?.replace(/^Bearer /,'')||url.searchParams.get('token');
         const master='#EXTM3U\n'+variants.map(variant=>'#EXT-X-STREAM-INF:BANDWIDTH='+({360:1100000,480:1900000,720:3500000,1080:6000000}[variant.height]||Math.round((variant.height/360)**1.7*1100000))+'\n'+variant.id+'/index.m3u8?token='+encodeURIComponent(token)).join('\n')+'\n';
         res.writeHead(200,{'Content-Type':'application/vnd.apple.mpegurl','Cache-Control':'private, no-store'});return res.end(master);
@@ -200,7 +206,7 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
         const {room}=authorize(req,url);const video=room.video;
         if(!video||video.version!==hlsMatch[2])throw new Fault(404,'Видео изменилось');
         ensureStreams(video);
-        const asset=await streamAsset(video,hlsMatch[3],hlsMatch[4]);if(!asset)throw new Fault(404,'Качество ещё готовится');
+        const asset=await (video.liveId?live.asset(video,hlsMatch[3],hlsMatch[4]):streamAsset(video,hlsMatch[3],hlsMatch[4]));if(!asset)throw new Fault(404,'Качество ещё готовится');
         if(asset.playlist) {
           const token=req.headers.authorization?.replace(/^Bearer /,'')||url.searchParams.get('token');
           const playlist=authenticatedPlaylist(await readFile(asset.path,'utf8'),token);
@@ -264,7 +270,7 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
           const requested=url.searchParams.get('quality');
           if(requested&&!/^\d{1,4}$/.test(requested))throw new Fault(400,'Некорректное качество');
           ensureStreams(video,requested);
-          return json(res,200,{...describeStreams(video),version:video.version});
+          return json(res,200,{...describeVideo(video),version:video.version});
         }
         if(req.method==='GET'&&action==='library') {
           requireHost(room,member);
@@ -287,7 +293,7 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
           }
           if([position,duration,bufferAhead].some(value=>!Number.isFinite(value)||value<0)||[waiting,blocked,paused].some(value=>typeof value!=='boolean'))throw new Fault(400,'Некорректное состояние плеера');
           member.watch={version,sequence,position,duration,bufferAhead,waiting,blocked,paused,at:Date.now()};
-          broadcast(room,'watch',{id:member.id,...member.watch,ready:watchReady(room.playback,member.watch)});
+          broadcast(room,'watch',{id:member.id,...member.watch,ready:watchReady(room.playback,member.watch,Date.now(),room.video.growing)});
           advance(room);
           return json(res,200,{ok:true});
         }
@@ -352,6 +358,7 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
           } finally {room.uploading=false;}
         }
         if ((req.method === 'GET'||req.method === 'HEAD') && action === 'video') {
+          if(room.video?.liveId)throw new Fault(409,'Этот источник доступен только через потоковый плеер');
           const video=room.video; if(!video||url.searchParams.get('v')!==video.version) throw new Fault(404,'Видео не найдено');
           const headers={'Content-Type':video.type,'Accept-Ranges':'bytes','Cache-Control':'private, max-age=3600'};
           let start=0,end=video.size-1,status=200;
@@ -391,7 +398,7 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
     const now=Date.now();
     let changed=false;
     for(const [key,room] of rooms) {
-      if(!room.members.size&&!room.uploading&&now-room.touched>3600000){rooms.delete(key);changed=true;}
+      if(!room.members.size&&!room.uploading&&now-room.touched>3600000){if(room.video?.liveId)live.stop(room.video.liveId);rooms.delete(key);changed=true;}
     }
     if(changed)persistRooms();
   },60000);
@@ -400,7 +407,26 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
   playbackCheck.unref();
   const checkpoint=setInterval(persistRooms,10000);
   checkpoint.unref();
+  const sourceControl=await localSourceControl(data,{
+    rooms:()=>[...rooms.values()].map(room=>({id:room.id,names:[...room.members.values()].map(member=>member.name),video:room.video?.name||null})),
+    async start(input){
+      const room=rooms.get(String(input.room));if(!room)throw new Error('Комната не найдена. Сначала создай комнату в браузере.');
+      if(room.uploading)throw new Error('Подожди завершения текущей загрузки');
+      if(room.video?.liveId)live.stop(room.video.liveId);
+      const video=await live.start(String(input.file||''),(updated,media)=>{
+        if(room.video?.liveId!==updated.liveId)return;
+        room.video={...room.video,...updated};
+        if(media.error)setPlayback(room,'paused',playbackPosition(room.playback));
+        state(room);broadcast(room,'media',{...media,version:room.video.version});
+        advance(room);
+      });
+      room.video={...video,version:id(9)};setPlayback(room,'paused',0);state(room);
+      return {id:video.liveId,name:video.name};
+    },
+    status:id=>live.describe({liveId:id}),finish:id=>live.finish(id),stop:id=>live.stop(id)
+  });
   server.on('close',()=>{
+    sourceControl.close();live.close().catch(()=>{});
     log('server_stopped');
     persistRooms();clearInterval(checkpoint);clearInterval(cleanup);clearInterval(playbackCheck);
     for(const room of rooms.values())for(const member of room.members.values()) {
