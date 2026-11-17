@@ -12,6 +12,8 @@ const screenCards=new Map();
 let displayCapture=null,callView=false,focusedTile=null,callMuted=false;
 let micTestUrl,micTestTrack;
 let participantsOpen=false,expandedScreen=null,screenReturn=null;
+let cameraWindow=null,cameraWindowGrid=null,cameraWindowOpening=false;
+const cameraWindowCards=new Map();
 let libraryBusy=false,fullscreenTimer,hlsLoading=false,hlsUnavailable=false;
 const libraryKey=getLibraryKey();
 const playbackIntent=()=>!!room&&room.playback.phase!=='paused';
@@ -396,14 +398,17 @@ function state(next) {
 }
 function setParticipantsOpen(open) {
   participantsOpen=!!open;
-  $('participants-drawer').hidden=callView||!participantsOpen;
-  $('participants-toggle').setAttribute('aria-expanded',String(!callView&&participantsOpen));
+  const available=!callView&&fullscreen();
+  const visible=available&&participantsOpen;
+  $('participants-drawer').hidden=!visible;
+  $('participants-toggle').hidden=!available;
+  $('participants-toggle').setAttribute('aria-expanded',String(visible));
   $('participants-toggle-label').textContent=participantsOpen?'↓ Скрыть участников':'↑ Участники';
-  $('player').classList.toggle('participants-open',participantsOpen&&!callView);
+  $('player').classList.toggle('participants-open',visible);
   if(typeof showFullscreenControls==='function')showFullscreenControls();
 }
 function refreshParticipantDrawer() {
-  const target=callView?$('call-tiles'):$('participants-tiles');
+  const target=$(callView?'call-tiles':fullscreen()?'participants-tiles':'sidebar-tiles');
   if($('people').parentElement!==target)target.append($('people'));
   $('participants-count').textContent=room?.members.length||0;
   $('participants-toggle').disabled=!session;
@@ -436,6 +441,7 @@ async function openScreenFullscreen(tile) {
 }
 function renderCallLayout() {
   refreshParticipantDrawer();
+  refreshCameraWindow();
   const tiles=$('people');
   tiles.classList.toggle('is-focused',callView&&!!focusedTile);
   const self=cards.get(session?.id);
@@ -454,8 +460,6 @@ function setCallView(on) {
   callView=on;
   $('cinema').hidden=on;
   $('call-stage').hidden=!on;
-  (on?$('call-tiles'):$('participants-tiles')).append($('people'));
-  setParticipantsOpen(participantsOpen);
   $('movie-mode').setAttribute('aria-pressed',String(!on));
   $('call-mode').setAttribute('aria-pressed',String(on));
   renderCallLayout();
@@ -549,6 +553,89 @@ function attach(id, stream) {
   video.hidden = !videoTracks.some(track => track.enabled && !track.muted);
   if (videoTracks.length) video.play().catch(() => {});
   if(id!==session.id)bindCallAudio(card,stream);
+  refreshCameraWindow();
+}
+function refreshCameraWindow() {
+  const button=$('camera-window');
+  const supported=!!window.documentPictureInPicture;
+  const open=!!cameraWindow&&!cameraWindow.closed;
+  button.hidden=!supported;
+  button.disabled=!session||cameraWindowOpening||!supported;
+  button.setAttribute('aria-pressed',String(open));
+  button.textContent=open?'Закрыть окно камер':'Камеры поверх окон';
+  button.title=supported?'Окно можно двигать и менять в размере. Правый клик закрывает его.':'Для окна с несколькими камерами нужен браузер с Document Picture-in-Picture, например Chrome.';
+  if(!open||!cameraWindowGrid)return;
+  const visible=new Set();
+  for(const [id,card] of cards) {
+    const source=card.querySelector('video');
+    const track=source.srcObject?.getVideoTracks().find(track=>track.readyState==='live'&&track.enabled&&!track.muted);
+    if(source.hidden||!track)continue;
+    visible.add(id);
+    let tile=cameraWindowCards.get(id);
+    if(!tile) {
+      tile=cameraWindow.document.createElement('div');
+      tile.className='camera-window-tile';
+      const video=cameraWindow.document.createElement('video');
+      video.autoplay=true;video.playsInline=true;video.muted=true;
+      const label=cameraWindow.document.createElement('span');
+      tile.append(video,label);
+      cameraWindowGrid.append(tile);
+      cameraWindowCards.set(id,tile);
+    }
+    const video=tile.querySelector('video');
+    tile.querySelector('span').textContent=card.querySelector('.person-name').textContent;
+    if(video.dataset.track!==track.id) {
+      video.dataset.track=track.id;
+      video.srcObject=new MediaStream([track]);
+      video.play().catch(()=>{});
+    }
+  }
+  for(const [id,tile] of cameraWindowCards)if(!visible.has(id)) {
+    tile.querySelector('video').srcObject=null;
+    tile.remove();
+    cameraWindowCards.delete(id);
+  }
+  cameraWindow.document.getElementById('camera-window-empty').hidden=visible.size>0;
+}
+function closeCameraWindow() {
+  const popup=cameraWindow;
+  cameraWindow=null;cameraWindowGrid=null;
+  for(const tile of cameraWindowCards.values())tile.querySelector('video').srcObject=null;
+  cameraWindowCards.clear();
+  popup?.close();
+  refreshCameraWindow();
+}
+async function toggleCameraWindow() {
+  if(cameraWindow&&!cameraWindow.closed){closeCameraWindow();return;}
+  if(!session||cameraWindowOpening)return;
+  if(!window.documentPictureInPicture){toast('Открой Together в Chrome, чтобы вынести камеры поверх других окон.');return;}
+  const current=session;
+  cameraWindowOpening=true;
+  refreshCameraWindow();
+  try {
+    const popup=await window.documentPictureInPicture.requestWindow({width:360,height:240});
+    if(session!==current){popup.close();return;}
+    cameraWindow=popup;
+    popup.addEventListener('pagehide',()=>{if(cameraWindow===popup)closeCameraWindow();},{once:true});
+    const doc=popup.document;
+    doc.title='Together — камеры';
+    const style=doc.createElement('link');
+    style.rel='stylesheet';style.href=new URL('/style.css',location.href).href;
+    doc.head.append(style);
+    doc.body.className='camera-window-view';
+    cameraWindowGrid=doc.createElement('div');
+    cameraWindowGrid.className='camera-window-grid';
+    const empty=doc.createElement('p');
+    empty.id='camera-window-empty';empty.textContent='Камеры выключены';
+    doc.body.append(cameraWindowGrid,empty);
+    doc.addEventListener('contextmenu',event=>{event.preventDefault();closeCameraWindow();});
+  }catch {
+    closeCameraWindow();
+    toast('Не удалось открыть окно камер. Разреши Picture-in-Picture в настройках браузера.');
+  }finally {
+    cameraWindowOpening=false;
+    refreshCameraWindow();
+  }
 }
 function summarizeCandidate(candidate) {
   const parts = String(candidate.candidate || '').split(' ');
@@ -656,6 +743,7 @@ async function shareWatchPosition() {
 }
 async function leaveRoom() {
   if(!session)return;
+  closeCameraWindow();
   isScrubbing=false;const old=session;forgetSession(old.room);
   micTestTrack?.stop();
   micTestTrack=null;
@@ -685,7 +773,7 @@ async function leaveRoom() {
   $('movie-name').textContent='Твой следующий любимый фильм';$('movie-detail').textContent='Добавь видео, а мы позаботимся о синхронизации';
   $('people').replaceChildren();$('messages').replaceChildren();$('chat-input').value='';
   $('invite').disabled=true;$('leave-room').hidden=true;$('enable-audio').hidden=true;
-  for(const key of ['mic','camera','call-mode','share-screen','mute-call','mic-processing','mic-test','chat-input','send'])$(key).disabled=true;
+  for(const key of ['mic','camera','camera-window','call-mode','share-screen','share-audio','mute-call','mic-processing','mic-test','chat-input','send'])$(key).disabled=true;
   for(const key of ['mic','camera']){$(key).classList.remove('on');$(key).querySelector('i').textContent='выкл.';$(key).setAttribute('aria-pressed','false');}
   $('call-note').textContent='Ты вышел из комнаты. Камера и микрофон выключены.';
   requestedRoom=null;history.replaceState(null,'','/');
@@ -782,7 +870,8 @@ async function enter(e){
     }else session=await api('/api/rooms',{name},false);
     rememberSession(session,name);requestedRoom=session.room;history.replaceState(null,'','?room='+session.room);
     $('new-room').hidden=true;$('welcome').close();$('invite').disabled=false;$('leave-room').hidden=false;
-    for(const key of ['mic','camera','call-mode','share-screen','mute-call','mic-processing','mic-test','chat-input','send'])$(key).disabled=false;
+    for(const key of ['mic','camera','call-mode','share-screen','share-audio','mute-call','mic-processing','mic-test','chat-input','send'])$(key).disabled=false;
+    updateScreenButton();
     connect();if(!navigator.mediaDevices)$('call-note').textContent='Камера и микрофон доступны через HTTPS или localhost.';
   }catch(error){
     toast(error.message);
@@ -1042,9 +1131,13 @@ async function toggle(kind) {
 function updateDevices(){for(const [kind,key]of [['audio','mic'],['video','camera']]){const on=media.getTracks().some(t=>t.kind===kind&&t.enabled&&t.readyState==='live');$(key).classList.toggle('on',on);$(key).querySelector('i').textContent=on?'вкл.':'выкл.';$(key).setAttribute('aria-pressed',String(on));}attach(session.id,media);}
 function updateScreenButton() {
   const button=$('share-screen');
+  const supported=!!navigator.mediaDevices?.getDisplayMedia;
+  button.hidden=!supported;
   button.classList.toggle('on',!!displayCapture);
   button.setAttribute('aria-pressed',String(!!displayCapture));
   button.lastElementChild.textContent=displayCapture?'Остановить показ':'Показать экран';
+  $('share-audio').disabled=!session||!!displayCapture||!supported;
+  $('share-audio').closest('label').hidden=!supported;
 }
 async function stopScreenShare() {
   if(!displayCapture)return;
@@ -1066,16 +1159,27 @@ async function toggleScreenShare() {
     return;
   }
   button.disabled=true;
+  $('share-audio').disabled=true;
+  const withAudio=$('share-audio').checked;
+  const canExcludeOwnAudio=navigator.mediaDevices.getSupportedConstraints?.().restrictOwnAudio===true;
   try {
     const capture=await navigator.mediaDevices.getDisplayMedia({
-      video:{width:{ideal:1280},frameRate:{ideal:20,max:30}},audio:true,
-      selfBrowserSurface:'exclude',systemAudio:'exclude'
+      video:{width:{ideal:1280},frameRate:{ideal:20,max:30}},
+      audio:withAudio?{restrictOwnAudio:true,suppressLocalAudioPlayback:false}:false,
+      selfBrowserSurface:'exclude',
+      surfaceSwitching:'exclude',
+      systemAudio:withAudio&&canExcludeOwnAudio?'include':'exclude',
+      windowAudio:withAudio&&canExcludeOwnAudio?'window':'exclude'
     });
     const video=capture.getVideoTracks()[0];
     if(session!==current||!video){for(const track of capture.getTracks())track.stop();return;}
     const surface=video.getSettings().displaySurface;
-    if(surface&&surface!=='browser')for(const track of capture.getAudioTracks()){
-      capture.removeTrack(track);track.stop();
+    let excludedUnsafeAudio=false;
+    for(const track of capture.getAudioTracks()) {
+      if(!withAudio||surface!=='browser'&&track.getSettings().restrictOwnAudio!==true) {
+        excludedUnsafeAudio=withAudio;
+        capture.removeTrack(track);track.stop();
+      }
     }
     if('contentHint' in video)video.contentHint='detail';
     displayCapture=capture;
@@ -1085,9 +1189,18 @@ async function toggleScreenShare() {
     focusedTile=screenCards.get(current.id)||null;
     setCallView(true);
     await Promise.all([announceScreen(true),sendTrack('screen',video),sendTrack('screenAudio',capture.getAudioTracks()[0]||null)]);
+    if(excludedUnsafeAudio) {
+      $('call-note').textContent='Показ идёт без звука: браузер не смог исключить звук Together. Для передачи звука выбери отдельную вкладку или обнови Chrome.';
+    } else if(!withAudio) {
+      $('call-note').textContent='Демонстрация без звука.';
+    } else if(capture.getAudioTracks().length) {
+      $('call-note').textContent='Демонстрация со звуком. Звук Together исключён.';
+    } else {
+      $('call-note').textContent='Браузер передал только видео. Для звука включи его передачу в окне выбора экрана или выбери вкладку браузера.';
+    }
   } catch(error) {
     if(error.name!=='NotAllowedError')toast('Не удалось запустить демонстрацию экрана.');
-  } finally {button.disabled=!session;}
+  } finally {button.disabled=!session;$('share-audio').disabled=!session||!!displayCapture;}
 }
 function getLibraryKey() {
   const generated=[...crypto.getRandomValues(new Uint8Array(24))].map(byte=>byte.toString(16).padStart(2,'0')).join('');
@@ -1295,7 +1408,7 @@ function showFullscreenControls() {
   if(fullscreen())fullscreenTimer=setTimeout(hideFullscreenControls,2200);
 }
 function fullscreenChanged() {
-  showFullscreenControls();
+  refreshParticipantDrawer();
   $('fullscreen').setAttribute('aria-label',fullscreen()?'Выйти из полного экрана':'Полный экран');
 }
 $('fullscreen').onclick=async()=>{
@@ -1343,6 +1456,7 @@ $('call-focus').onchange=event=>{
   renderCallLayout();
 };
 $('share-screen').onclick=toggleScreenShare;
+$('camera-window').onclick=toggleCameraWindow;
 $('mic').onclick=()=>toggle('audio');$('camera').onclick=()=>toggle('video');$('chat-form').onsubmit=async e=>{e.preventDefault();const input=$('chat-input'),text=input.value.trim();if(!text)return;input.value='';try{await command('chat',{text});}catch(error){input.value=text;toast(error.message);}};
 window.addEventListener('keydown',event=>{
   if(fullscreen()) {
@@ -1355,11 +1469,22 @@ window.addEventListener('keydown',event=>{
   if(event.code==='ArrowLeft'&&host()&&version){event.preventDefault();seekTo(movie.currentTime-10);}
 });
 window.addEventListener('beforeunload',()=>{
+  cameraWindow?.close();
   events?.close();
   for(const track of [...media.getTracks(),...(displayCapture?.getTracks()||[])])track.stop();
 });
+function resumeConnection() {
+  if(!session)return;
+  if(!connected||!events||events.readyState!==EventSource.OPEN||Date.now()-lastRoomEvent>12000) {
+    clearTimeout(reconnectTimer);reconnectTimer=null;
+    reconnect('heartbeat_timeout');
+    return;
+  }
+  syncPlayback();scheduleWatch();
+}
 document.addEventListener('visibilitychange',()=>{
-  if(!document.hidden&&connected){syncPlayback();scheduleWatch();}
+  if(!document.hidden)resumeConnection();
 });
+window.addEventListener('online',resumeConnection);
 setInterval(()=>{if(events&&Date.now()-lastRoomEvent>12000)reconnect('heartbeat_timeout');if(version){syncPlayback();updateBufferDisplay();}},1000);
 setInterval(()=>{if(connected)syncClock();},60000);

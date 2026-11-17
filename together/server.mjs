@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
+const RECONNECT_GRACE_MS=5*60*1000;
 const id = (bytes = 18) => randomBytes(bytes).toString('base64url');
 const mime={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.svg':'image/svg+xml'};
 const staticFiles=new Map(Object.entries({'/':'index.html','/app.js':'app.js','/hls.min.js':'hls.min.js','/style.css':'style.css','/favicon.svg':'favicon.svg'}).map(([route,file])=>{
@@ -158,7 +159,7 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
       setPlayback(room,'paused',video?item.playback?.position||0:0);
       for(const old of item.members||[]) {
         const member={...old,stream:null};
-        member.timer=setTimeout(()=>leave(room,member),120000);
+        member.timer=setTimeout(()=>{if(!member.stream)leave(room,member,true);},RECONNECT_GRACE_MS);
         room.members.set(member.id,member);
       }
       rooms.set(room.id,room);
@@ -224,7 +225,7 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
           if(input.token){
             const member=[...room.members.values()].find(member=>member.token===input.token);
             if(!member)throw new Fault(401,'Сессия истекла');
-            clearTimeout(member.timer);member.timer=setTimeout(()=>{if(!member.stream)leave(room,member,true);},60000);
+            clearTimeout(member.timer);member.timer=setTimeout(()=>{if(!member.stream)leave(room,member,true);},RECONNECT_GRACE_MS);
             log('member_resumed',{room:room.id,member:member.id});
             room.touched=Date.now();persistRooms();return json(res,200,{room:room.id,id:member.id,token:member.token});
           }
@@ -250,7 +251,7 @@ export async function createApp({publicOrigin=()=>process.env.PUBLIC_URL||null,s
             if(member.stream!==res||!rooms.has(room.id)||!room.members.has(member.id))return;
             member.stream=null;
             log('events_disconnected',{room:room.id,member:member.id,lastWatchMs:member.watch?Date.now()-member.watch.at:null});
-            member.timer=setTimeout(()=>leave(room,member,true),60000);
+            member.timer=setTimeout(()=>{if(!member.stream)leave(room,member,true);},RECONNECT_GRACE_MS);
             if(room.video)updateGroupPlayback(room);
             state(room);
           });
