@@ -1,106 +1,187 @@
 'use strict';
 const $=id=>document.getElementById(id),movie=$('movie'),peers=new Map(),cards=new Map(),media=new MediaStream();
-let session,room,config,events,version,upload,toastTimer,applyingUntil=0,pending,connected=false,joining=false;
+let session,room,config,events,version,upload,toastTimer,connected=false,joining=false;
 let requestedRoom=new URLSearchParams(location.search).get('room');
 const watchPositions=new Map();
 let isScrubbing=false;
-let playbackIntent=false,bufferHolding=false,bufferChecking=false,autoplayBlocked=false,bufferPausePosition=null,peerBufferOverride=false;
-let playbackWrite=Promise.resolve(),playbackRevision=0;
-let streamPlayer=null,streamCatalog=null,currentStream='original',sourceResume=null,streamManifest=null,qualityPreference='auto',mediaPolling=false,streamWatchdog=null,streamGeneration=0;
+let autoplayBlocked=false,unlocking=false,playAttempt=null,startTimer,clockOffset=0;
+let playbackWrite=Promise.resolve(),pendingSeek,watchTimer,watchBusy=false,watchAgain=false;
+let reconnectTimer,reconnectReason,lastRoomEvent,heldPlayback,mediaWaiting=false,mediaRetry,mediaRetryCount=0,mediaSource;
+let streamPlayer=null,streamCatalog=null,currentStream=null,playedVersion,qualityPreference='auto',streamWatchdog,sourceLoading=false,sourceFailed=false;
+const screenCards=new Map();
+let displayCapture=null,callView=false,focusedTile=null,callMuted=false;
+let micTestUrl,micTestTrack;
+let libraryBusy=false,fullscreenTimer,hlsLoading=false,hlsUnavailable=false;
+const libraryKey=getLibraryKey();
+const playbackIntent=()=>!!room&&room.playback.phase!=='paused';
 const host=()=>!!session&&!!room&&room.host===session.id;
 function toast(text){$('toast').textContent=text;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,6500);}
 const endpoint=action=>`/api/rooms/${encodeURIComponent(session.room)}/${action}`;
-async function api(url,data,auth=true){const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',...(auth&&session?{Authorization:'Bearer '+session.token}:{})},body:JSON.stringify(data)});const result=await response.json();if(!response.ok){const error=new Error(result.error||'Ошибка сервера');error.status=response.status;throw error;}return result;}
+async function api(url,data,auth=true) {
+  const current=auth?session:null;
+  const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',...(current?{Authorization:'Bearer '+current.token,'X-Library-Key':libraryKey}:{})},body:JSON.stringify(data),signal:AbortSignal.timeout(10000)});
+  if(!response.ok) {
+    if(response.status===401&&current&&session===current)location.reload();
+    const body=await response.json().catch(()=>null);
+    const error=new Error(body?.error||'Ошибка сервера ('+response.status+')');
+    error.status=response.status;
+    throw error;
+  }
+  return response.json();
+}
 const command=(action,data)=>api(endpoint(action),data);
 function time(seconds){seconds=Math.max(0,Math.floor(Number.isFinite(seconds)?seconds:0));return (seconds>=3600?Math.floor(seconds/3600)+':':'')+String(Math.floor(seconds/60)%60).padStart(2,'0')+':'+String(seconds%60).padStart(2,'0');}
 function updateTime(){
-  const duration=Number.isFinite(movie.duration)?movie.duration:0;
-  const position=isScrubbing?Number($('seek').value):movie.currentTime||0;
+  const duration=Number.isFinite(movie.duration)?movie.duration:streamCatalog?.duration||0;
+  const playback=room?.playback;
+  const showingTarget=playback&&(playback.phase!=='playing'||sourceLoading||movie.seeking||movie.readyState<2||movie.paused);
+  const position=isScrubbing?Number($('seek').value):showingTarget
+    ?Math.min(duration||Infinity,targetPosition()):movie.currentTime||0;
   $('time').replaceChildren(document.createTextNode(time(position)+' '));
   const span=document.createElement('span');span.textContent='/ '+time(duration);$('time').append(span);
   $('seek').max=duration||100;
   if(!isScrubbing)$('seek').value=position;
-  const active=host()?playbackIntent:!movie.paused;
+  const active=host()?playbackIntent():!movie.paused;
   $('play').textContent=active?'Ⅱ':'▶';$('play').setAttribute('aria-label',active?'Пауза':'Воспроизвести');
   $('played-track').style.width=(duration?Math.min(100,position/duration*100):0)+'%';
 }
 
 function destroyStreamPlayer() {
-  clearTimeout(streamWatchdog);streamWatchdog=null;streamPlayer?.destroy();streamPlayer=null;
-  if(streamManifest){URL.revokeObjectURL(streamManifest);streamManifest=null;}
+  clearTimeout(streamWatchdog);
+  streamPlayer?.destroy();
+  streamPlayer=null;
 }
-function originalVideoUrl(){return endpoint('video')+'?token='+encodeURIComponent(session.token)+'&v='+encodeURIComponent(version);}
-function qualityUrl(quality){return location.origin+endpoint('hls')+'/'+encodeURIComponent(version)+'/'+quality+'/index.m3u8?token='+encodeURIComponent(session.token);}
+function mediaUrl(action) {
+  return endpoint(action)+'?token='+encodeURIComponent(session.token);
+}
+function originalVideoUrl(){return mediaUrl('video')+'&v='+encodeURIComponent(version);}
 function showQualities(catalog) {
   const select=$('quality'),chosen=qualityPreference;
-  select.replaceChildren();
-  for(const [value,label]of [['auto','Авто'],['original','Оригинал']]){const option=document.createElement('option');option.value=value;option.textContent=label;select.append(option);}
+  select.replaceChildren(new Option('Авто','auto'),new Option('Оригинал','original'));
   for(const variant of catalog?.variants||[]) {
     if(variant.id==='source')continue;
-    const option=document.createElement('option');option.value=variant.id;
-    option.textContent=variant.height+'p'+(variant.ready?'':variant.failed?' · недоступно':variant.processing||variant.requested?' · готовится':' · по запросу');
-    option.disabled=variant.failed;select.append(option);
+    const status=variant.ready?'':variant.failed?' · недоступно':variant.requested?' · готовится':' · по запросу';
+    const option=new Option(variant.height+'p'+status,variant.id);
+    option.disabled=variant.failed;
+    select.append(option);
   }
   select.value=[...select.options].some(option=>option.value===chosen)?chosen:'auto';
 }
-async function useQuality(choice,automatic=false) {
-  if(!session||!version)return;
-  const expectedVersion=version;
-  const available=(streamCatalog?.variants||[]).filter(variant=>variant.ready);
-  const variants=choice==='original'?[]:choice==='auto'?available.filter(v=>v.id!=='source'&&v.height<=720):available.filter(v=>v.id===choice);
-  if(!variants.length&&choice!=='auto'&&choice!=='original'){
-    if(!automatic){try{const response=await fetch(endpoint('media')+'?quality='+encodeURIComponent(choice),{headers:{Authorization:'Bearer '+session.token}});if(!response.ok)throw new Error();streamCatalog=await response.json();showQualities(streamCatalog);toast('Готовим '+choice+'p. Пока оставляю текущее качество.');}catch{toast('Не удалось запустить подготовку качества');}}
+function changeSource(target,url,hlsSource) {
+  const position=targetPosition();
+  clearTimeout(mediaRetry);mediaRetry=null;
+  if(mediaSource?.target!==target||mediaSource?.version!==version)mediaRetryCount=0;
+  mediaSource={version,target,url,hlsSource};
+  sourceLoading=true;
+  sourceFailed=false;
+  mediaWaiting=true;
+  playAttempt=null;
+  movie.pause();
+  destroyStreamPlayer();
+  currentStream=target;
+  movie.preload='auto';
+  scheduleWatch();
+  if(!hlsSource||typeof Hls==='undefined'||!Hls.isSupported()) {
+    movie.src=url;
+    movie.load();
     return;
   }
-  if(!variants.length) {
-    if(!automatic&&choice!=='auto'&&choice!=='original')toast('Это качество ещё готовится');
-    if(currentStream==='original')return;
+  const hls=new Hls({
+    enableWorker:true,maxBufferLength:120,maxMaxBufferLength:120,maxBufferSize:96*1024*1024,
+    backBufferLength:30,startPosition:position,startLevel:0,
+    capLevelToPlayerSize:target.startsWith('auto:'),abrEwmaDefaultEstimate:700000,
+    abrBandWidthFactor:0.75,abrBandWidthUpFactor:0.55
+  });
+  streamPlayer=hls;
+  let recoveries=0;
+  const fallback=()=>{
+    if(streamPlayer!==hls||!version)return;
+    toast('Не удалось открыть поток. Загружаю исходный файл.');
+    qualityPreference='original';
+    showQualities(streamCatalog);
+    changeSource('original',originalVideoUrl(),false);
+  };
+  hls.on(Hls.Events.ERROR,(_,data)=>{
+    if(streamPlayer!==hls||!data.fatal)return;
+    if(++recoveries>2){if(data.type===Hls.ErrorTypes.NETWORK_ERROR)retryMedia();else fallback();return;}
+    if(data.type===Hls.ErrorTypes.NETWORK_ERROR) {
+      if(!hls.levels.length)hls.loadSource(url);
+      else hls.startLoad(targetPosition());
+    } else if(data.type===Hls.ErrorTypes.MEDIA_ERROR)hls.recoverMediaError();
+    else fallback();
+  });
+  hls.on(Hls.Events.FRAG_BUFFERED,(_,data)=>{
+    if(streamPlayer===hls&&typeof data.frag.sn==='number')clearTimeout(streamWatchdog);
+  });
+  hls.on(Hls.Events.MEDIA_ATTACHED,()=>hls.loadSource(url));
+  hls.attachMedia(movie);
+  streamWatchdog=setTimeout(()=>{if(movie.readyState<2)retryMedia();},20000);
+}
+function retryMedia() {
+  if(mediaRetry||!mediaSource||mediaSource.version!==version)return;
+  const source=mediaSource;
+  sourceLoading=true;
+  mediaWaiting=true;
+  movie.pause();
+  scheduleWatch();
+  mediaRetry=setTimeout(()=>{
+    mediaRetry=null;
+    if(mediaSource===source&&version===source.version)changeSource(source.target,source.url,source.hlsSource);
+  },Math.min(8000,1000*2**mediaRetryCount++));
+}
+function loadHls() {
+  if(hlsLoading)return;
+  hlsLoading=true;
+  const script=document.createElement('script');
+  script.src='/hls.min.js';
+  script.onload=()=>useQuality(qualityPreference,true);
+  script.onerror=()=>{hlsUnavailable=true;useQuality(qualityPreference,true);};
+  document.head.append(script);
+}
+async function useQuality(choice,automatic=false) {
+  if(!session||!version)return;
+  const ready=(streamCatalog?.variants||[]).filter(variant=>variant.ready);
+  const optimized=ready.filter(variant=>variant.id!=='source'&&variant.height<=720);
+  const variants=choice==='original'?[]:choice==='auto'?(optimized.length?optimized:ready):ready.filter(variant=>variant.id===choice);
+  if(!variants.length&&choice!=='original'&&choice!=='auto') {
+    if(!automatic) {
+      try{await loadCatalog(choice);toast('Готовим '+choice+'p. Пока оставляю текущее качество.');}
+      catch{toast('Не удалось запустить подготовку качества');}
+    }
+    return;
   }
-  const target=variants.length?(choice==='auto'?'auto:'+variants.map(v=>v.id).join(','):variants[0].id):'original';
+  if(variants.length&&(window.MediaSource||window.ManagedMediaSource)&&typeof Hls==='undefined'&&!hlsUnavailable) {
+    loadHls();
+    if(!currentStream)changeSource('original',originalVideoUrl(),false);
+    return;
+  }
+  const canHls=(typeof Hls!=='undefined'&&Hls.isSupported())||movie.canPlayType('application/vnd.apple.mpegurl');
+  const hlsSource=canHls&&variants.length>0;
+  const target=hlsSource?(choice==='auto'?'auto:'+variants.map(v=>v.id).join(','):variants[0].id):'original';
   if(target===currentStream)return;
-  if(automatic&&currentStream!=='original'&&choice==='auto')return;
-  const generation=++streamGeneration;playbackRevision++;
-  const resume={position:movie.readyState?movie.currentTime:(pending?.position||0),shouldPlay:host()?playbackIntent:pending?!pending.paused:!movie.paused};
-  if(host()&&playbackIntent)await holdForBuffer();
-  if(generation!==streamGeneration||!session||version!==expectedVersion)return;
-  sourceResume=resume;destroyStreamPlayer();currentStream=target;
-  movie.preload='auto';
-  if(variants.length&&typeof Hls!=='undefined'&&Hls.isSupported()) {
-    streamPlayer=new Hls({enableWorker:true,maxBufferLength:120,maxMaxBufferLength:180,maxBufferSize:128*1024*1024,backBufferLength:30,startPosition:resume.position,capLevelToPlayerSize:choice==='auto',startLevel:0,abrEwmaDefaultEstimate:700000,abrBandWidthFactor:0.7,abrBandWidthUpFactor:0.5});
-    const hls=streamPlayer;
-    const sourceUrl=choice==='auto'?location.origin+endpoint('hls')+'/'+encodeURIComponent(version)+'/master.m3u8?token='+encodeURIComponent(session.token):qualityUrl(variants[0].id);
-    let recoveries=0;
-    const fallback=reason=>{
-      if(streamPlayer!==hls||!session||!version)return;
-      toast('Поток не загрузился ('+reason+'). Открываю оригинал.');
-      sourceResume=resume;destroyStreamPlayer();currentStream='original';qualityPreference='original';showQualities(streamCatalog);movie.src=originalVideoUrl();movie.load();
-    };
-    hls.on(Hls.Events.ERROR,(_,data)=>{
-      if(!data.fatal)return;
-      if(++recoveries>2){fallback(data.details||'ошибка');return;}
-      if(data.type===Hls.ErrorTypes.NETWORK_ERROR){if(String(data.details).toLowerCase().includes('manifest'))hls.loadSource(sourceUrl);else hls.startLoad(movie.currentTime||resume.position);}
-      else if(data.type===Hls.ErrorTypes.MEDIA_ERROR)hls.recoverMediaError();
-      else fallback(data.details||'ошибка');
-    });
-    hls.on(Hls.Events.FRAG_BUFFERED,()=>{clearTimeout(streamWatchdog);streamWatchdog=null;});
-    hls.on(Hls.Events.MEDIA_ATTACHED,()=>hls.loadSource(sourceUrl));hls.attachMedia(movie);
-    streamWatchdog=setTimeout(()=>{if(movie.readyState<2)fallback('нет кадров за 15 секунд');},15000);
-  } else {
-    movie.src=variants.length&&movie.canPlayType('application/vnd.apple.mpegurl')?qualityUrl(variants[0].id):originalVideoUrl();movie.load();
-  }
+  // An automatic source replacement discards the buffer and resets the media clock.
+  if(automatic&&choice==='auto'&&currentStream&&!sourceFailed&&
+    (playedVersion===version||room.playback.phase==='playing'))return;
+  if(hlsSource) {
+    const base='hls/'+encodeURIComponent(version)+'/';
+    const manifest=choice==='auto'&&typeof Hls!=='undefined'&&Hls.isSupported()?
+      'master.m3u8':variants[0].id+'/index.m3u8';
+    changeSource(target,mediaUrl(base+manifest),true);
+  } else changeSource(target,originalVideoUrl(),false);
 }
-async function pollStreams() {
-  if(mediaPolling||!session||!version)return;
-  const expected=version;mediaPolling=true;
-  try {
-    const response=await fetch(endpoint('media'),{headers:{Authorization:'Bearer '+session.token}});
-    if(!response.ok)return;
-    const catalog=await response.json();if(version!==expected)return;
-    streamCatalog=catalog;showQualities(catalog);
-    await useQuality(qualityPreference,true);
-  }catch{}finally{mediaPolling=false;}
+function applyCatalog(catalog,initial=false) {
+  if(catalog.version!==version||(catalog.revision||0)<(streamCatalog?.revision||0))return;
+  streamCatalog=catalog;
+  showQualities(catalog);
+  if(initial||currentStream||catalog.variants.some(variant=>variant.ready))useQuality(qualityPreference,true);
+  if(sourceFailed&&catalog.status==='failed')toast('Браузер не смог открыть видео. Попробуй MP4 (H.264 + AAC) или WebM.');
 }
-setInterval(()=>{if(streamCatalog?.status!=='ready'&&streamCatalog?.status!=='failed')pollStreams();},4000);
+async function loadCatalog(quality) {
+  const query=quality?'?quality='+encodeURIComponent(quality):'';
+  const response=await fetch(endpoint('media')+query,{headers:{Authorization:'Bearer '+session.token},signal:AbortSignal.timeout(3000)});
+  if(!response.ok)throw new Error('Нет данных о качестве');
+  applyCatalog(await response.json(),true);
+}
 function bufferedAhead(video, position=video.currentTime || 0) {
   let end=position;
   for(let i=0;i<video.buffered.length;i++) {
@@ -109,143 +190,291 @@ function bufferedAhead(video, position=video.currentTime || 0) {
   }
   return Math.max(0,end-position);
 }
-function bufferReady(video, minimum=5) {
-  if(video.seeking || video.readyState<3)return false;
-  const remaining=Number.isFinite(video.duration)?Math.max(0,video.duration-video.currentTime):Infinity;
-  return bufferedAhead(video)>=Math.min(minimum,remaining)-0.15;
+function localTime(){return performance.timeOrigin+performance.now();}
+function serverNow(){return localTime()+clockOffset;}
+async function syncClock() {
+  const samples=await Promise.allSettled(Array.from({length:3},async()=>{
+    const sent=localTime();
+    const response=await fetch('/api/time',{signal:AbortSignal.timeout(3000)});
+    const {now}=await response.json(),received=localTime();
+    if(!Number.isFinite(now))throw new Error('Нет времени сервера');
+    return {latency:received-sent,offset:now-(sent+received)/2};
+  }));
+  const best=samples.flatMap(sample=>sample.status==='fulfilled'?[sample.value]:[]).sort((a,b)=>a.latency-b.latency)[0];
+  if(best)clockOffset=best.offset;
+}
+function targetPosition(now=serverNow()) {
+  const playback=room?.playback;
+  if(!playback)return 0;
+  return playback.position+(playback.phase==='playing'?Math.max(0,now-playback.at)/1000:0);
 }
 function bufferWaiters() {
-  const waiters=[];
-  if(!room||!session)return waiters;
-  const starting=bufferHolding||movie.paused;
-  if(!bufferReady(movie,starting?5:1))waiters.push({id:session.id,name:'Ты',reason:movie.seeking?'завершаем перемотку':movie.readyState<3&&bufferedAhead(movie)>5?'подготавливаем кадры':'буфер '+time(bufferedAhead(movie))});
-  if(peerBufferOverride)return waiters;
-  for(const member of room.members) {
-    if(member.id===session.id)continue;
-    const report=watchPositions.get(member.id),name=member.name||'Участник';
-    let reason='';
-    if(!report||Date.now()-report.receivedAt>8000)reason='нет свежих данных';
-    else if(report.version!==version)reason='открывает видео';
-    else if(Math.abs(report.position+(report.paused?0:(Date.now()-report.receivedAt)/1000)-movie.currentTime)>=2)reason='переходит к '+time(movie.currentTime);
-    else if(starting?!report.readyToPlay:report.waiting||report.bufferAhead<Math.min(1,Math.max(0,movie.duration-report.position))-0.15)reason='буфер '+time(report.bufferAhead||0);
-    if(reason)waiters.push({id:member.id,name,reason});
-  }
-  return waiters;
+  const playback=room.playback;
+  return room.members.filter(member=>{
+    const report=watchPositions.get(member.id);
+    return member.present&&(!member.online||!report?.ready||report.sequence!==playback.sequence||Date.now()-report.receivedAt>5500);
+  }).map(member=>member.id===session.id?'тебя':member.name);
 }
 function updateBufferDisplay() {
   const ahead=bufferedAhead(movie);
-  $('buffer-health').textContent=version?'Загружено вперёд: '+time(ahead)+(streamPlayer?.bandwidthEstimate?' · '+(streamPlayer.bandwidthEstimate/1000000).toFixed(1)+' Мбит/с':''):'У каждого своя громкость. У всех один момент.';
-  const track=$('buffered-track');track.replaceChildren();
+  $('buffer-health').textContent=version?'Загружено вперёд: '+time(ahead)+(streamPlayer?.bandwidthEstimate?' · '+(streamPlayer.bandwidthEstimate/1000000).toFixed(1)+' Мбит/с':''):'';
+  const track=$('buffered-track');
+  track.replaceChildren();
   if(Number.isFinite(movie.duration)&&movie.duration>0)for(let i=0;i<movie.buffered.length;i++) {
-    const segment=document.createElement('span');segment.style.left=(movie.buffered.start(i)/movie.duration*100)+'%';segment.style.width=((movie.buffered.end(i)-movie.buffered.start(i))/movie.duration*100)+'%';track.append(segment);
+    const segment=document.createElement('span');
+    segment.style.left=(movie.buffered.start(i)/movie.duration*100)+'%';
+    segment.style.width=((movie.buffered.end(i)-movie.buffered.start(i))/movie.duration*100)+'%';
+    track.append(segment);
   }
-  const leader=room?.host&&watchPositions.get(room.host);
-  const waitingForGroup=host()?bufferHolding:leader?.version===version&&leader?.buffering&&Date.now()-leader.receivedAt<8000;
-  const localWaiting=!!version&&!movie.paused&&(movie.readyState<3||movie.seeking);
-  $('buffer-overlay').hidden=!version||(!waitingForGroup&&!localWaiting);
-  const waiters=host()?bufferWaiters():[];
-  const remoteWaiters=waiters.filter(waiter=>waiter.id!==session?.id);
-  const ownWaiter=waiters.find(waiter=>waiter.id===session?.id);
-  $('buffer-message').textContent=waitingForGroup?(ownWaiter?'Подготавливаем твоё видео…':remoteWaiters.length?'Ждём: '+remoteWaiters.map(waiter=>waiter.name).join(', '):'Готово, продолжаем…'):'Подгружаем видео…';
-  $('buffer-description').textContent='Твой буфер: '+time(ahead)+(host()&&waiters.length?' · '+waiters.map(waiter=>waiter.name+': '+waiter.reason).join('; '):leader?.bufferReason?' · '+leader.bufferReason:'');
-  $('continue-buffer').hidden=!host()||!bufferHolding||!!ownWaiter||!remoteWaiters.length;
-
-}
-function writePlayback(position,paused) {
-  const expectedVersion=version,expectedSession=session?.id;
-  playbackWrite=playbackWrite.catch(()=>{}).then(()=>{
-    if(!session||session.id!==expectedSession||version!==expectedVersion)return;
-    if(!host())return;
-    return command('playback',{position,paused,version:expectedVersion});
-  });
-  return playbackWrite;
-}
-async function holdForBuffer() {
-  if(!host()||!version||!playbackIntent)return;
-  const entering=!bufferHolding,position=movie.currentTime||0;
-  bufferHolding=true;movie.pause();updateBufferDisplay();
-  // A second seek while already buffering must update every viewer's target too.
-  if(entering||bufferPausePosition===null||Math.abs(bufferPausePosition-position)>0.1) {
-    bufferPausePosition=position;
-    await writePlayback(position,true).catch(error=>toast(error.message));
-    shareWatchPosition();
-  }
-}
-
-async function checkPlaybackBuffer() {
-  if(bufferChecking||!host()||!version||!playbackIntent||autoplayBlocked||!connected)return;
-  bufferChecking=true;
-  const revision=playbackRevision;
-  try {
-    const ready=bufferWaiters().length===0;
-    if(!ready) {await holdForBuffer();return;}
-    if(bufferHolding||movie.paused) {
-      bufferHolding=false;
-      try {
-        await movie.play();if(revision!==playbackRevision){movie.pause();return;}$('enable-play').hidden=true;
-        await writePlayback(movie.currentTime||0,false);
-        shareWatchPosition();
-      } catch(error) {
-        if(error.name==='NotAllowedError') {autoplayBlocked=true;$('enable-play').hidden=false;}
-        else {playbackIntent=false;toast('Не удалось начать воспроизведение: '+error.message);}
-      }
-    }
-  } finally {bufferChecking=false;updateBufferDisplay();}
-}
-async function requestPlayPause() {
-  if(!host()||!version)return;
-  playbackRevision++;autoplayBlocked=false;peerBufferOverride=false;bufferPausePosition=null;
-  if(playbackIntent) {
-    playbackIntent=false;bufferHolding=false;movie.pause();
-    await writePlayback(movie.currentTime||0,true).catch(error=>toast(error.message));
+  const phase=room?.playback.phase;
+  const group=phase==='buffering';
+  const localWaiting=sourceLoading||(!movie.ended&&!movie.paused&&(movie.readyState<3||movie.seeking));
+  const needsClick=connected&&playbackIntent()&&autoplayBlocked;
+  $('enable-play').hidden=!version||!needsClick;
+  $('buffer-overlay').hidden=!version||needsClick||(!group&&!localWaiting&&!sourceFailed);
+  if(sourceFailed) {
+    $('buffer-message').textContent=streamCatalog?.status==='failed'?'Не удалось открыть видео':'Готовим поток для этого файла…';
+    $('buffer-description').textContent=streamCatalog?.status==='failed'?'Выбери другое качество или файл MP4 (H.264 + AAC).':'';
+  } else if(group) {
+    const waiting=bufferWaiters();
+    $('buffer-message').textContent=waiting.length?'Ждём: '+waiting.join(', '):'Готово. Скоро продолжим…';
+    $('buffer-description').textContent='Твой буфер: '+time(ahead);
   } else {
-    playbackIntent=true;
-    // Start in the user's click handler to unlock media playback, then hold while buffering.
-    const unlock=movie.play();
-    await holdForBuffer();
-    unlock.catch(error=>{if(error.name==='NotSupportedError')toast('Формат видео не поддерживается браузером');});
-    await checkPlaybackBuffer();
+    $('buffer-message').textContent='Подгружаем видео…';
+    $('buffer-description').textContent='';
   }
-  updateTime();updateBufferDisplay();
+}
+function startPlayback() {
+  if(autoplayBlocked||playAttempt||!movie.paused||movie.ended||heldPlayback===room?.playback)return;
+  const attempt=movie.play();
+  playAttempt=attempt;
+  attempt.catch(error=>{
+    if(playAttempt!==attempt)return;
+    if(error.name==='NotAllowedError')autoplayBlocked=true;
+  }).finally(()=>{
+    if(playAttempt!==attempt)return;
+    playAttempt=null;
+    updateBufferDisplay();
+    scheduleWatch();
+  });
+}
+function syncPlayback(force=false) {
+  clearTimeout(startTimer);
+  if(!version||!room)return;
+  if(sourceLoading||movie.readyState===0||unlocking){updateTime();return;}
+  const {phase,at}=room.playback;
+  const now=serverNow();
+  const delay=at-now;
+  const target=Math.min(movie.duration||Infinity,targetPosition(now));
+  const playing=connected&&phase==='playing'&&delay<=0;
+  if(!playing) {
+    if(!movie.paused)movie.pause();
+    if(connected&&phase==='playing')startTimer=setTimeout(syncPlayback,delay);
+  }
+  const drift=Math.abs(movie.currentTime-target);
+  if((force||!movie.seeking)&&drift>(force||!playing?0.12:0.35)&&(!playing||force||movie.readyState>=3))movie.currentTime=target;
+  if(playing&&!movie.seeking)startPlayback();
+  updateTime();
+}
+function receivePlayback(next) {
+  if(!room||next.version!==version||next.sequence<=room.playback.sequence)return;
+  room.playback=next;
+  syncPlayback(true);
+  if(next.phase!=='playing')useQuality(qualityPreference,true);
+  updateBufferDisplay();
+  scheduleWatch();
+}
+function writePlayback(action,position,sequence) {
+  if(!host()||!version||!connected)return;
+  const expectedSession=session,expectedVersion=version;
+  return playbackWrite=playbackWrite.catch(()=>{}).then(async()=>{
+    if(!host()||session!==expectedSession||version!==expectedVersion)return;
+    const playback=await command('playback',{action,position,sequence,version:expectedVersion});
+    if(session===expectedSession)receivePlayback(playback);
+  }).catch(error=>toast(error.message));
+}
+function requestPlayPause() {
+  if(playbackIntent())writePlayback('pause');
+  else writePlayback('play',movie.ended||movie.currentTime>=movie.duration-0.08?0:undefined);
 }
 function seekTo(position) {
-  if(!host()||!version)return;
-  playbackRevision++;peerBufferOverride=false;
-  movie.currentTime=Math.max(0,Math.min(Number.isFinite(movie.duration)?movie.duration:position,position));
-  if(playbackIntent)holdForBuffer();
-  else publish();
-  updateTime();updateBufferDisplay();
+  if(!host()||!version||!connected||!Number.isFinite(position))return;
+  const target=Math.max(0,Math.min(Number.isFinite(movie.duration)?movie.duration:position,position));
+  const request={session,version,target};
+  pendingSeek=request;
+  writePlayback('seek',target).finally(()=>{
+    if(pendingSeek===request)pendingSeek=null;
+  });
 }
-setInterval(checkPlaybackBuffer,500);
-setInterval(updateBufferDisplay,1000);
-for(const event of ['progress','loadedmetadata','canplay','canplaythrough','waiting','stalled','seeking','seeked','playing','pause','emptied'])movie.addEventListener(event,()=>{
-  updateBufferDisplay();
-  if(['waiting','seeking'].includes(event)&&host()&&playbackIntent)holdForBuffer();
-  if(['canplay','canplaythrough','progress','seeked'].includes(event))checkPlaybackBuffer();
-});
-async function publish(){if(!host()||!version||Date.now()<applyingUntil||!connected)return;try{await writePlayback(movie.currentTime||0,movie.paused);}catch(e){toast(e.message);}}
-async function apply(playback,force=false){pending=playback;if(!version||!movie.readyState||(!force&&host()))return;applyingUntil=Date.now()+700;const target=playback.position+(playback.paused?0:Math.max(0,(Date.now()-playback.at)/1000));const drift=Math.abs(movie.currentTime-target);const stalled=!movie.paused&&movie.readyState<3;if(Number.isFinite(movie.duration)&&drift>.7&&(!stalled||playback.paused||force||drift>15))movie.currentTime=Math.min(target,movie.duration);if(playback.paused){movie.pause();$('enable-play').hidden=true;}else{try{await movie.play();$('enable-play').hidden=true;}catch{$('enable-play').hidden=false;}}updateTime();}
+function seekBy(delta) {
+  const base=pendingSeek&&pendingSeek.session===session&&pendingSeek.version===version
+    ?pendingSeek.target:targetPosition();
+  seekTo(base+delta);
+}
 function updateHostRole(previousHost) {
-  if(previousHost===room.host)return;
-  playbackRevision++;
-  bufferHolding=false;bufferChecking=false;bufferPausePosition=null;peerBufferOverride=false;autoplayBlocked=false;
-  playbackIntent=host()&&!room.playback.paused;
-  if(sourceResume)sourceResume.shouldPlay=!room.playback.paused;
-  $('continue-buffer').hidden=true;
-  if(previousHost&&room.host===session.id)toast('Теперь ты ведущий: доступны плеер, загрузка видео и передача управления.');
+  if(previousHost&&room.host!==previousHost&&host())toast('Теперь ты ведущий. Ты управляешь видео в комнате.');
 }
 function renderHostSelector() {
-  const selector=$('host-selector');selector.replaceChildren();
-  for(const member of room?.members||[]) {const option=document.createElement('option');option.value=member.id;option.textContent=member.name+(member.id===session?.id?' · ты':'');selector.append(option);}
-  selector.value=room?.host||'';selector.disabled=!host()||!connected;
+  const selector=$('host-selector');
+  selector.replaceChildren();
+  for(const member of room?.members||[])selector.append(new Option(member.name+(member.id===session?.id?' · ты':''),member.id));
+  selector.value=room?.host||'';
+  selector.disabled=!host()||!connected;
 }
 async function transferHost(id) {
   if(!host()||!id||id===room.host)return;
   $('host-selector').disabled=true;
   try{await command('host',{id});}catch(error){toast(error.message);renderHostSelector();}
 }
-function access(){for(const key of ['play','back','seek'])$(key).disabled=!host()||!version||!connected;for(const key of ['pick','replace'])$(key).disabled=!host()||!connected||!!upload;$('pick').hidden=!host();$('empty-copy').textContent=host()?'Выбери видео с компьютера. Мы соберём всех перед одним экраном.':'Ведущий выбирает видео. Пока можно включить микрофон и поздороваться.';$('sync-status').textContent=host()?'Ты ведущий · управляй общим плеером':'Синхронизировано с ведущим';}
-function state(next){const previousHost=room?.host;room=next;$('count').textContent=room.members.length;$('room-label').textContent='Комната · '+session.room.slice(0,6);if(room.video?.version!==version){destroyStreamPlayer();streamCatalog=null;currentStream='original';sourceResume=null;bufferPausePosition=null;peerBufferOverride=false;version=room.video?.version||null;playbackIntent=false;bufferHolding=false;autoplayBlocked=false;if(version){movie.src=endpoint('video')+`?token=${encodeURIComponent(session.token)}&v=${encodeURIComponent(version)}`;$('screen').classList.add('has-video');$('empty').hidden=true;$('movie-name').textContent=room.video.name;$('movie-detail').textContent=`${(room.video.size/1024**2).toFixed(0)} МБ · общий файл для всей комнаты`;movie.preload='auto';movie.load();showQualities(null);pollStreams();}else{movie.removeAttribute('src');movie.load();$('screen').classList.remove('has-video');$('empty').hidden=false;}}pending=room.playback;updateHostRole(previousHost);apply(pending,previousHost!==room.host);renderPeople();renderMessages();access();renderHostSelector();updateTime();updateBufferDisplay();const ids=new Set(room.members.map(m=>m.id));for(const [key,peer]of peers)if(!ids.has(key)){peer.pc.close();peers.delete(key);}for(const member of room.members)if(member.id!==session.id&&!peers.has(member.id))makePeer(member.id);}
+function access() {
+  for(const key of ['play','back','seek'])$(key).disabled=!host()||!version||!connected;
+  for(const key of ['pick','replace'])$(key).disabled=!host()||!connected||!!upload;
+  $('pick').hidden=!host();
+  $('replace').hidden=!host()||!version;
+  $('empty-copy').textContent=host()?'Выбери сохранённое видео или добавь файл с компьютера.':'Ведущий выбирает видео.';
+  $('sync-status').textContent=host()?'Ты управляешь плеером':'Плеер синхронизирован с ведущим';
+}
+function state(next) {
+  const previousHost=room?.host,nextVersion=next.video?.version||null,changed=nextVersion!==version;
+  if(!changed&&room&&next.playback.sequence<room.playback.sequence) {
+    next.playback=room.playback;
+  }
+  const newPlayback=room?.playback.sequence!==next.playback.sequence;
+  room=next;
+  $('count').textContent=room.members.length;
+  $('room-label').textContent='Комната · '+session.room.slice(0,6);
+  if(changed) {
+    destroyStreamPlayer();
+    version=nextVersion;
+    streamCatalog=null;
+    currentStream=null;
+    qualityPreference='auto';
+    playAttempt=null;
+    sourceFailed=false;
+    sourceLoading=!!version;
+    isScrubbing=false;
+    watchPositions.clear();
+    movie.pause();
+    movie.removeAttribute('src');
+    movie.load();
+    $('screen').classList.toggle('has-video',!!version);
+    $('empty').hidden=!!version;
+    showQualities(null);
+    if(version) {
+      $('movie-name').textContent=room.video.name;
+      $('movie-detail').textContent=fileSize(room.video.size);
+      const expected=version;
+      loadCatalog().catch(()=>{}).finally(()=>{
+        if(version===expected&&!currentStream)useQuality('auto',true);
+      });
+    }
+  }
+  updateHostRole(previousHost);
+  syncPlayback(newPlayback);
+  renderPeople();
+  renderCallLayout();
+  renderMessages();
+  access();
+  renderHostSelector();
+  updateTime();
+  updateBufferDisplay();
+  scheduleWatch();
+  const ids=new Set(room.members.map(member=>member.id));
+  for(const [key,peer]of peers)if(!ids.has(key)){peer.pc.close();peers.delete(key);watchPositions.delete(key);const tile=screenCards.get(key);if(tile){screenCards.delete(key);removeTile(tile);}}
+  for(const member of room.members)if(member.id!==session.id&&!peers.has(member.id))makePeer(member.id);
+}
+function renderCallLayout() {
+  const tiles=$('people');
+  tiles.classList.toggle('is-focused',callView&&!!focusedTile);
+  const self=cards.get(session?.id);
+  const select=$('call-focus');
+  const entries=[...cards.values(),...screenCards.values()];
+  select.replaceChildren(new Option('Все участники',''));
+  select.append(...entries.map((tile,index)=>new Option(tile.dataset.focusLabel,String(index))));
+  select.value=focusedTile?String(entries.indexOf(focusedTile)):'';
+  for(const tile of entries) {
+    tile.classList.toggle('is-main',callView&&tile===focusedTile);
+    tile.classList.toggle('is-preview',callView&&!!focusedTile&&tile!==focusedTile&&tile===self);
+    tile.querySelector('.focus-tile')?.setAttribute('aria-pressed',String(callView&&tile===focusedTile));
+  }
+}
+function setCallView(on) {
+  callView=on;
+  $('cinema').hidden=on;
+  $('call-stage').hidden=!on;
+  (on?$('call-tiles'):$('sidebar-tiles')).append($('people'));
+  $('movie-mode').setAttribute('aria-pressed',String(!on));
+  $('call-mode').setAttribute('aria-pressed',String(on));
+  renderCallLayout();
+}
+function addFocusButton(tile,label) {
+  const button=document.createElement('button');
+  tile.dataset.focusLabel=label;
+  button.type='button';
+  button.className='focus-tile';
+  button.setAttribute('aria-label',label);
+  button.setAttribute('aria-pressed','false');
+  button.onclick=()=>{
+    focusedTile=callView&&focusedTile===tile?null:tile;
+    setCallView(true);
+  };
+  tile.append(button);
+}
+function removeTile(tile) {
+  if(focusedTile===tile)focusedTile=null;
+  tile.remove();
+  renderCallLayout();
+}
+function attachScreen(id,stream) {
+  const track=stream?.getVideoTracks().find(item=>item.readyState==='live'&&!item.muted);
+  let tile=screenCards.get(id);
+  if(!track) {
+    if(tile){screenCards.delete(id);removeTile(tile);}
+    return;
+  }
+  if(!tile) {
+    tile=document.createElement('div');
+    tile.className='person screen-tile';
+    const name=room?.members.find(member=>member.id===id)?.name||'Участник';
+    const video=document.createElement('video'),label=document.createElement('span');
+    video.autoplay=true;video.playsInline=true;video.muted=true;
+    label.className='screen-name';label.textContent='Экран · '+name;
+    tile.append(video,label);
+    addFocusButton(tile,'Показать экран участника '+name);
+    screenCards.set(id,tile);
+    $('people').append(tile);
+  }
+  const video=tile.querySelector('video');
+  if(video.dataset.tracks!==track.id) {
+    video.dataset.tracks=track.id;
+    video.srcObject=new MediaStream([track]);
+    video.play().catch(()=>{});
+  }
+  if(id!==session?.id)bindCallAudio(tile,stream);
+  renderCallLayout();
+}
+function bindCallAudio(tile,stream) {
+  let audio=tile.querySelector('audio');
+  if(!audio){audio=document.createElement('audio');audio.autoplay=true;tile.append(audio);}
+  audio.muted=callMuted;
+  const tracks=stream.getAudioTracks().filter(track=>track.readyState==='live');
+  const key=tracks.map(track=>track.id).join(',');
+  if(audio.dataset.tracks!==key) {
+    audio.dataset.tracks=key;
+    audio.srcObject=new MediaStream(tracks);
+  }
+  if(tracks.length&&!callMuted)audio.play().catch(()=>{$('enable-audio').hidden=false;});
+}
+function setCallMuted(muted) {
+  callMuted=muted;
+  $('mute-call').setAttribute('aria-pressed',String(muted));
+  $('mute-call').textContent=muted?'Вернуть звук звонка':'Заглушить звонок';
+  for(const audio of $('people').querySelectorAll('audio')) {
+    audio.muted=muted;
+    if(!muted&&audio.srcObject?.getAudioTracks().length)audio.play().catch(()=>$('enable-audio').hidden=false);
+  }
+  if(muted)$('enable-audio').hidden=true;
+}
 function attach(id, stream) {
   const card = cards.get(id);
   if (!card || !stream) return;
@@ -260,17 +489,7 @@ function attach(id, stream) {
   }
   video.hidden = !videoTracks.some(track => track.enabled && !track.muted);
   if (videoTracks.length) video.play().catch(() => {});
-  if (id !== session.id) {
-    let audio = card.querySelector('audio');
-    if (!audio) {audio = document.createElement('audio');audio.autoplay = true;card.append(audio);}
-    const audioTracks = stream.getAudioTracks().filter(track => track.readyState === 'live');
-    const audioKey = audioTracks.map(track => track.id).join(',');
-    if (audio.dataset.tracks !== audioKey) {
-      audio.dataset.tracks = audioKey;
-      audio.srcObject = new MediaStream(audioTracks);
-    }
-    if (audioTracks.length) audio.play().catch(() => {$('enable-audio').hidden = false;});
-  }
+  if(id!==session.id)bindCallAudio(card,stream);
 }
 function summarizeCandidate(candidate) {
   const parts = String(candidate.candidate || '').split(' ');
@@ -284,6 +503,9 @@ async function connectionReport() {
     name:room?.members.find(member => member.id === session?.id)?.name || '',
     secureContext:window.isSecureContext,
     signaling:connected,
+    callMuted,
+    screenCapture:displayCapture?{surface:displayCapture.getVideoTracks()[0]?.getSettings().displaySurface||null,
+      audio:displayCapture.getAudioTracks().length>0}:null,
     player:{quality:qualityPreference,mode:currentStream,readyState:movie.readyState,networkState:movie.networkState,position:movie.currentTime,duration:Number.isFinite(movie.duration)?movie.duration:null,bufferAhead:bufferedAhead(movie),error:movie.error?{code:movie.error.code,message:movie.error.message}:null},
     localDevices:media.getTracks().map(track => ({kind:track.kind,enabled:track.enabled,muted:track.muted,state:track.readyState})),
     peers:[]
@@ -302,7 +524,7 @@ async function connectionReport() {
       const stats = await peer.pc.getStats();
       stats.forEach(item => {
         if (item.type === 'transport') entry.transports.push({dtls:item.dtlsState,ice:item.iceState});
-        if (item.type === 'inbound-rtp' || item.type === 'outbound-rtp') entry.media.push({direction:item.type,kind:item.kind || item.mediaType,bytesReceived:item.bytesReceived,bytesSent:item.bytesSent,packetsReceived:item.packetsReceived,packetsSent:item.packetsSent,framesDecoded:item.framesDecoded,framesEncoded:item.framesEncoded});
+        if (item.type === 'inbound-rtp' || item.type === 'outbound-rtp') entry.media.push({direction:item.type,kind:item.kind || item.mediaType,bytesReceived:item.bytesReceived,bytesSent:item.bytesSent,packetsReceived:item.packetsReceived,packetsSent:item.packetsSent,packetsLost:item.packetsLost,jitter:item.jitter,concealedSamples:item.concealedSamples,totalSamplesReceived:item.totalSamplesReceived,audioLevel:item.audioLevel,framesDecoded:item.framesDecoded,framesEncoded:item.framesEncoded});
         if (item.type === 'candidate-pair') {
           const local = stats.get(item.localCandidateId),remote = stats.get(item.remoteCandidateId);
           entry.candidatePairs.push({state:item.state,nominated:item.nominated,requestsSent:item.requestsSent,responsesReceived:item.responsesReceived,requestsReceived:item.requestsReceived,responsesSent:item.responsesSent,localType:local?.candidateType,localProtocol:local?.protocol,remoteType:remote?.candidateType,remoteProtocol:remote?.protocol});
@@ -337,7 +559,7 @@ async function refreshPeerStatus(id, peer) {
   } catch {peerStatus(id, 'Связь есть');}
 }
 
-function renderPeople(){const ids=new Set(room.members.map(m=>m.id));for(const [id,card]of cards)if(!ids.has(id)){card.remove();cards.delete(id);}if(!cards.size)$('people').replaceChildren();for(const member of room.members){let card=cards.get(member.id);if(!card){card=document.createElement('div');card.className='person';const avatar=document.createElement('span');avatar.className='avatar';const video=document.createElement('video');video.autoplay=true;video.playsInline=true;video.hidden=true;video.muted=member.id===session.id;if(video.muted)video.className='self';const name=document.createElement('span');name.className='person-name';const badge=document.createElement('span');badge.className='host-badge';badge.textContent='ВЕДУЩИЙ';const give=document.createElement('button');give.className='give-host';give.textContent='♔';give.title='Передать управление';give.onclick=()=>transferHost(member.id);const timestamp=document.createElement('span');timestamp.className='person-time';timestamp.setAttribute('aria-label','Позиция просмотра');card.append(avatar,video,name,badge,give,timestamp);cards.set(member.id,card);$('people').append(card);}card.querySelector('.avatar').textContent=member.name.slice(0,2).toUpperCase();card.querySelector('.person-name').textContent=member.name+(member.id===session.id?' · ты':'');card.querySelector('.host-badge').hidden=room.host!==member.id;card.querySelector('.give-host').hidden=!host()||member.id===session.id;attach(member.id,member.id===session.id?media:peers.get(member.id)?.stream);updateParticipantTime(member.id);}}
+function renderPeople(){const ids=new Set(room.members.map(m=>m.id));for(const [id,card]of cards)if(!ids.has(id)){cards.delete(id);removeTile(card);}if(!cards.size)$('people').replaceChildren();for(const member of room.members){let card=cards.get(member.id);if(!card){card=document.createElement('div');card.className='person';const avatar=document.createElement('span');avatar.className='avatar';const video=document.createElement('video');video.autoplay=true;video.playsInline=true;video.hidden=true;video.muted=member.id===session.id;if(video.muted)video.className='self';const name=document.createElement('span');name.className='person-name';const badge=document.createElement('span');badge.className='host-badge';badge.textContent='ВЕДУЩИЙ';const give=document.createElement('button');give.className='give-host';give.textContent='♔';give.title='Передать управление';give.onclick=()=>transferHost(member.id);const timestamp=document.createElement('span');timestamp.className='person-time';timestamp.setAttribute('aria-label','Позиция просмотра');card.append(avatar,video,name,badge,give,timestamp);addFocusButton(card,'Показать камеру участника '+member.name);cards.set(member.id,card);$('people').append(card);}card.querySelector('.avatar').textContent=member.name.slice(0,2).toUpperCase();card.querySelector('.person-name').textContent=member.name+(member.id===session.id?' · ты':'');card.querySelector('.host-badge').hidden=room.host!==member.id;card.querySelector('.give-host').hidden=!host()||member.id===session.id;attach(member.id,member.id===session.id?media:peers.get(member.id)?.stream);updateParticipantTime(member.id);}}
 function updateParticipantTime(id) {
   const label=cards.get(id)?.querySelector('.person-time');
   if(!label)return;
@@ -347,24 +569,56 @@ function updateParticipantTime(id) {
   if(value.version!==version){label.textContent='Ждёт видео';return;}
   label.textContent=time(value.position)+' · '+(value.waiting?'загрузка':value.paused?'пауза':'смотрит');
 }
+function scheduleWatch() {
+  if(!session||!version||!connected)return;
+  if(watchBusy){watchAgain=true;return;}
+  if(!watchTimer)watchTimer=setTimeout(shareWatchPosition,100);
+}
 async function shareWatchPosition() {
-  if(!session||!room||!connected)return;
-  const watch={version,position:movie.currentTime||0,paused:movie.paused,waiting:movie.readyState<3||movie.seeking||bufferHolding,buffering:bufferHolding,bufferAhead:bufferedAhead(movie),readyToPlay:bufferReady(movie),bufferReason:host()&&bufferHolding?bufferWaiters().map(waiter=>waiter.name+': '+waiter.reason).join('; '):''};
-  const others=room.members.filter(member=>member.id!==session.id);
-  await Promise.allSettled(others.map(member=>command('signal',{to:member.id,signal:{watch}})));
-  if(!room||!session)return;
-  for(const member of room.members)updateParticipantTime(member.id);
+  watchTimer=null;
+  if(!session||!version||!connected)return;
+  watchBusy=true;
+  const duration=Number.isFinite(movie.duration)?movie.duration:0;
+  const watch={
+    version,sequence:room.playback.sequence,position:movie.currentTime||0,duration,
+    paused:movie.paused,waiting:!duration||sourceLoading||sourceFailed||unlocking||movie.seeking||(!movie.ended&&(mediaWaiting||movie.readyState<3)),
+    blocked:autoplayBlocked,bufferAhead:bufferedAhead(movie)
+  };
+  const current=session;
+  try{
+    const result=await command('watch',watch);
+    if(current===session&&result.playback)receivePlayback(result.playback);
+  }
+  catch(error){if(current===session&&error.status!==401&&connected)reconnect('watch_'+(error.status||'network'));}
+  finally {
+    watchBusy=false;
+    if(watchAgain){watchAgain=false;scheduleWatch();}
+  }
 }
 async function leaveRoom() {
   if(!session)return;
   isScrubbing=false;const old=session;forgetSession(old.room);
+  micTestTrack?.stop();
+  micTestTrack=null;
+  $('mic-test').textContent='Записать тест микрофона';
+  const micSample=$('mic-test-audio');
+  micSample.removeAttribute('src');micSample.load();micSample.hidden=true;
+  if(micTestUrl)URL.revokeObjectURL(micTestUrl);
+  micTestUrl=null;
+  if($('library').open)$('library').close();
   const leaveUrl=endpoint('leave');
   upload?.abort();
+  clearTimeout(reconnectTimer);reconnectTimer=null;reconnectReason=null;clearTimeout(mediaRetry);mediaRetry=null;
   events?.close();events=null;
-  connected=false;session=null;room=null;version=null;pending=null;playbackIntent=false;bufferHolding=false;autoplayBlocked=false;
+  connected=false;session=null;room=null;version=null;autoplayBlocked=false;playAttempt=null;
+  clearTimeout(startTimer);clearTimeout(watchTimer);watchTimer=null;watchAgain=false;
   for(const peer of peers.values())peer.pc.close();peers.clear();
+  if(displayCapture){for(const track of displayCapture.getTracks())track.stop();displayCapture=null;}
+  for(const tile of screenCards.values())tile.remove();
+  screenCards.clear();focusedTile=null;
+  setCallView(false);setCallMuted(false);updateScreenButton();
   for(const track of media.getTracks()){track.stop();media.removeTrack(track);}
-  destroyStreamPlayer();streamCatalog=null;currentStream='original';sourceResume=null;movie.pause();movie.removeAttribute('src');movie.load();
+  destroyStreamPlayer();streamCatalog=null;currentStream=null;sourceLoading=false;sourceFailed=false;movie.pause();movie.removeAttribute('src');movie.load();
   for(const card of cards.values()){for(const element of card.querySelectorAll('video,audio'))element.srcObject=null;card.remove();}
   cards.clear();watchPositions.clear();
   $('screen').classList.remove('has-video');$('empty').hidden=false;$('enable-play').hidden=true;
@@ -372,7 +626,7 @@ async function leaveRoom() {
   $('movie-name').textContent='Твой следующий любимый фильм';$('movie-detail').textContent='Добавь видео, а мы позаботимся о синхронизации';
   $('people').replaceChildren();$('messages').replaceChildren();$('chat-input').value='';
   $('invite').disabled=true;$('leave-room').hidden=true;$('enable-audio').hidden=true;
-  for(const key of ['mic','camera','chat-input','send'])$(key).disabled=true;
+  for(const key of ['mic','camera','call-mode','share-screen','mute-call','mic-processing','mic-test','chat-input','send'])$(key).disabled=true;
   for(const key of ['mic','camera']){$(key).classList.remove('on');$(key).querySelector('i').textContent='выкл.';$(key).setAttribute('aria-pressed','false');}
   $('call-note').textContent='Ты вышел из комнаты. Камера и микрофон выключены.';
   requestedRoom=null;history.replaceState(null,'','/');
@@ -383,12 +637,75 @@ async function leaveRoom() {
     if(!response.ok)throw new Error();
   }catch{toast('Ты вышел. Сервер удалит подключение после истечения тайм-аута.');}
 }
-setInterval(shareWatchPosition,2000);
+setInterval(scheduleWatch,1500);
 movie.addEventListener('timeupdate',()=>{if(session)updateParticipantTime(session.id);});
-for(const event of ['play','pause','seeked','loadedmetadata','waiting','playing'])movie.addEventListener(event,shareWatchPosition);
+
 function addMessage(message){$('messages').querySelector('.chat-welcome')?.remove();const item=document.createElement('div');item.className='message'+(message.from===session.id?' own':'');const author=document.createElement('div');author.className='message-author';author.textContent=message.name;const timestamp=document.createElement('time');timestamp.textContent=new Date(message.at).toLocaleTimeString('ru',{hour:'2-digit',minute:'2-digit'});author.append(timestamp);const text=document.createElement('div');text.className='message-text';text.textContent=message.text;item.append(author,text);$('messages').append(item);$('messages').scrollTop=$('messages').scrollHeight;}
 function renderMessages(){$('messages').replaceChildren();if(!room.messages.length){const intro=document.createElement('div');intro.className='chat-welcome';intro.textContent='✳ Здесь можно обсуждать всё. Но лучше без спойлеров.';$('messages').append(intro);}for(const message of room.messages)addMessage(message);}
-function connect(){events?.close();events=new EventSource(endpoint('events')+'?token='+encodeURIComponent(session.token));events.onopen=()=>{connected=true;$('connection').textContent='В СЕТИ';access();renderHostSelector();};events.onerror=()=>{connected=false;$('connection').textContent='ПЕРЕПОДКЛЮЧЕНИЕ';access();};events.addEventListener('state',e=>state(JSON.parse(e.data)));events.addEventListener('playback',e=>{const data=JSON.parse(e.data);if(data.version===version){room.playback=data;apply(data);}});events.addEventListener('chat',e=>{const message=JSON.parse(e.data);room.messages.push(message);room.messages=room.messages.slice(-80);addMessage(message);});events.addEventListener('signal',async e=>{const data=JSON.parse(e.data);try{await signal(data.from,data.signal);}catch(error){console.warn('WebRTC',error);$('call-note').textContent='Связь не установилась. Для некоторых сетей нужен TURN-сервер.';}});}
+function reconnect(reason) {
+  if(!session||reconnectTimer)return;
+  if(reason)reconnectReason=reason;
+  const current=session;
+  events?.close();
+  events=null;
+  connected=false;
+  clearTimeout(startTimer);
+  movie.pause();
+  $('connection').textContent='ПЕРЕПОДКЛЮЧЕНИЕ';
+  access();
+  renderHostSelector();
+  reconnectTimer=setTimeout(async()=>{
+    reconnectTimer=null;
+    if(session!==current)return;
+    try {
+      const response=await fetch(mediaUrl('session'),{method:'HEAD',signal:AbortSignal.timeout(5000)});
+      if(session!==current)return;
+      if(response.status===401||response.status===404){location.reload();return;}
+      if(!response.ok){reconnect();return;}
+      connect();
+    }catch{if(session===current)reconnect();}
+  },1800);
+}
+function connect() {
+  events?.close();
+  const source=new EventSource(mediaUrl('events'));
+  events=source;
+  lastRoomEvent=Date.now();
+  source.onerror=()=>{if(events===source)reconnect('events_closed');};
+  source.addEventListener('heartbeat',()=>{if(events===source)lastRoomEvent=Date.now();});
+  source.addEventListener('state',event=>{
+    if(events!==source)return;
+    lastRoomEvent=Date.now();
+    const reconnected=!connected;
+    connected=true;
+    $('connection').textContent='В СЕТИ';
+    state(JSON.parse(event.data));
+    if(reconnected) {
+      syncClock().then(()=>syncPlayback());
+      if(reconnectReason){command('clientevent',{reason:reconnectReason}).catch(()=>{});reconnectReason=null;}
+    }
+  });
+  source.addEventListener('playback',event=>receivePlayback(JSON.parse(event.data)));
+  source.addEventListener('media',event=>applyCatalog(JSON.parse(event.data)));
+  source.addEventListener('watch',event=>{
+    const report=JSON.parse(event.data);
+    if(report.version!==version)return;
+    watchPositions.set(report.id,{...report,receivedAt:Date.now()});
+    updateParticipantTime(report.id);
+    if(room?.playback.phase==='buffering')updateBufferDisplay();
+  });
+  source.addEventListener('chat',event=>{
+    const message=JSON.parse(event.data);
+    room.messages.push(message);
+    room.messages=room.messages.slice(-80);
+    addMessage(message);
+  });
+  source.addEventListener('signal',async event=>{
+    const data=JSON.parse(event.data);
+    try{await signal(data.from,data.signal);}
+    catch(error){console.warn('WebRTC',error);$('call-note').textContent='Связь не установилась. Для некоторых сетей нужен TURN-сервер.';}
+  });
+}
 function savedSession(roomId) {try{return JSON.parse(sessionStorage.getItem('together-session:'+roomId)||'null');}catch{return null;}}
 function rememberSession(value,name){try{sessionStorage.setItem('together-session:'+value.room,JSON.stringify({...value,name}));}catch{}}
 function forgetSession(roomId){try{sessionStorage.removeItem('together-session:'+roomId);}catch{}}
@@ -398,7 +715,7 @@ async function enter(e){
     const old=requestedRoom?savedSession(requestedRoom):null;
     const name=($('name').value||old?.name||'').trim();if(!name)throw new Error('Введи своё имя');
     try{localStorage.setItem('together-name',name);}catch{}
-    config=await fetch('/api/config').then(r=>r.json());config.iceServers=[...(config.iceServers||[]),{urls:'stun:stun.cloudflare.com:3478'},{urls:'stun:stun1.l.google.com:19302'}];
+    config=await fetch('/api/config').then(r=>r.json());
     if(requestedRoom){
       const joinUrl='/api/rooms/'+encodeURIComponent(requestedRoom)+'/join';
       try{session=await api(joinUrl,{name,...(old?.token?{token:old.token}:{})},false);}
@@ -406,7 +723,7 @@ async function enter(e){
     }else session=await api('/api/rooms',{name},false);
     rememberSession(session,name);requestedRoom=session.room;history.replaceState(null,'','?room='+session.room);
     $('new-room').hidden=true;$('welcome').close();$('invite').disabled=false;$('leave-room').hidden=false;
-    for(const key of ['mic','camera','chat-input','send'])$(key).disabled=false;
+    for(const key of ['mic','camera','call-mode','share-screen','mute-call','mic-processing','mic-test','chat-input','send'])$(key).disabled=false;
     connect();if(!navigator.mediaDevices)$('call-note').textContent='Камера и микрофон доступны через HTTPS или localhost.';
   }catch(error){
     toast(error.message);
@@ -418,23 +735,28 @@ function makePeer(id) {
   const pc = new RTCPeerConnection({iceServers:config.iceServers});
   const stream = new MediaStream();
   const initiator = session.id < id;
-  const peer = {pc,stream,initiator,makingOffer:false,ignoreOffer:false,settingAnswer:false,polite:!initiator,candidates:[],signalQueue:Promise.resolve(),restarted:false,ready:false,helloAnswered:false,localCandidates:[],remoteCandidates:[],iceErrors:[],signalErrors:[]};
+  const peer = {pc,stream,screen:new MediaStream(),initiator,makingOffer:false,ignoreOffer:false,settingAnswer:false,polite:!initiator,candidates:[],signalQueue:Promise.resolve(),restarted:false,ready:false,helloAnswered:false,localCandidates:[],remoteCandidates:[],iceErrors:[],signalErrors:[]};
   peers.set(id, peer);
   // Only the caller creates transceivers. The answerer reuses those from the offer.
-  if (initiator) for (const kind of ['audio','video']) {
-    const track = media.getTracks().find(t => t.kind === kind && t.readyState === 'live');
-    pc.addTransceiver(track || kind, {direction:'sendrecv',streams:[media]});
+  if(initiator)for(const slot of ['audio','video','screen','screenAudio']) {
+    const source=streamForSlot(slot),kind=kindForSlot(slot);
+    const track=source?.getTracks().find(item=>item.kind===kind&&item.readyState==='live');
+    pc.addTransceiver(track||kind,{direction:'sendrecv',streams:source?[source]:[]});
   }
   pc.onicecandidate = event => {
     if (event.candidate) {peer.localCandidates.push(summarizeCandidate(event.candidate));command('signal',{to:id,signal:{candidate:event.candidate}}).catch(error => peer.signalErrors.push(error.message));}
   };
   pc.onicecandidateerror = event => {peer.iceErrors.push({code:event.errorCode,message:event.errorText,url:event.url});};
   pc.ontrack = event => {
-    if (!stream.getTracks().some(track => track.id === event.track.id)) stream.addTrack(event.track);
-    event.track.onunmute = () => attach(id,stream);
-    event.track.onmute = () => attach(id,stream);
-    event.track.onended = () => {stream.removeTrack(event.track);attach(id,stream);};
-    attach(id,stream);
+    const slot=slotForTransceiver(pc,event.transceiver);
+    const sharing=slot==='screen'||slot==='screenAudio';
+    const incoming=sharing?peer.screen:stream;
+    const refresh=()=>sharing?attachScreen(id,peer.screenActive?incoming:null):attach(id,incoming);
+    incoming.addTrack(event.track);
+    event.track.onunmute=refresh;
+    event.track.onmute=refresh;
+    event.track.onended=()=>{incoming.removeTrack(event.track);refresh();};
+    refresh();
   };
   pc.onnegotiationneeded = async () => {
     if (!peer.ready || (!initiator && !pc.remoteDescription) || pc.signalingState !== 'stable' || peer.makingOffer) return;
@@ -450,18 +772,10 @@ function makePeer(id) {
     if (pc.connectionState === 'failed' && initiator && !peer.restarted) {peer.restarted = true;pc.restartIce();}
   };
   refreshPeerStatus(id,peer);
-  command('signal',{to:id,signal:{hello:true}}).catch(() => {});
+  command('signal',{to:id,signal:{hello:true,screenActive:!!displayCapture}}).catch(() => {});
   return peer;
 }
 function signal(from, input) {
-  if (input.watch) {
-    const value=input.watch;
-    if (typeof value.position==='number' && Number.isFinite(value.position) && value.position>=0) {
-      watchPositions.set(from,{...value,receivedAt:Date.now()});
-      updateParticipantTime(from);
-    }
-    return Promise.resolve();
-  }
   const peer = peers.get(from) || makePeer(from);
   // Description changes and ICE candidates must be applied in arrival order.
   const operation = peer.signalQueue.then(() => applySignal(from,peer,input));
@@ -471,9 +785,13 @@ function signal(from, input) {
 async function applySignal(from, peer, input) {
   const pc = peer.pc;
   if (pc.signalingState === 'closed') return;
+  if(typeof input.screenActive==='boolean') {
+    peer.screenActive=input.screenActive;
+    if(peer.screen.getTracks().length)attachScreen(from,peer.screenActive?peer.screen:null);
+  }
   if (input.hello) {
     peer.ready = true;
-    if (!peer.helloAnswered) {peer.helloAnswered = true;await command('signal',{to:from,signal:{hello:true}});}
+    if (!peer.helloAnswered) {peer.helloAnswered = true;await command('signal',{to:from,signal:{hello:true,screenActive:!!displayCapture}});}
     if (peer.initiator && !pc.localDescription && !peer.makingOffer) await pc.onnegotiationneeded();
     return;
   }
@@ -490,8 +808,9 @@ async function applySignal(from, peer, input) {
       for (const transceiver of pc.getTransceivers()) {
         if (transceiver.stopped) continue;
         transceiver.direction = 'sendrecv';
-        const track = media.getTracks().find(t => t.kind === transceiver.receiver.track.kind && t.readyState === 'live');
-        transceiver.sender.setStreams?.(media);
+        const source=streamForSlot(slotForTransceiver(pc,transceiver));
+        const track=source?.getTracks().find(t=>t.kind===transceiver.receiver.track.kind&&t.readyState==='live');
+        transceiver.sender.setStreams?.(...(source?[source]:[]));
         await transceiver.sender.replaceTrack(track || null);
       }
       await pc.setLocalDescription();
@@ -506,6 +825,20 @@ async function applySignal(from, peer, input) {
 }
 setInterval(() => {for (const [id,peer] of peers) refreshPeerStatus(id,peer);}, 5000);
 
+function kindForSlot(slot) {
+  if(slot==='screen')return 'video';
+  if(slot==='screenAudio')return 'audio';
+  return slot;
+}
+function slotForTransceiver(pc,transceiver) {
+  const kind=transceiver.receiver.track.kind;
+  const tracks=pc.getTransceivers().filter(item=>item.receiver.track.kind===kind);
+  if(tracks.indexOf(transceiver)>0)return kind==='video'?'screen':'screenAudio';
+  return kind;
+}
+function streamForSlot(slot) {
+  return slot==='screen'||slot==='screenAudio'?displayCapture:media;
+}
 function deviceError(error, kind) {
   const device = kind === 'video' ? 'камере' : 'микрофону';
   const messages = {
@@ -525,14 +858,82 @@ function deviceError(error, kind) {
 async function sendTrack(kind, track) {
   const active = [...peers.values()].filter(peer => peer.pc.signalingState !== 'closed');
   const results = await Promise.allSettled(active.map(async peer => {
-    const transceiver = peer.pc.getTransceivers().find(t => !t.stopped && t.receiver.track.kind === kind);
-    if (transceiver) await transceiver.sender.replaceTrack(track);
-    else if (track) peer.pc.addTrack(track, media);
+    const display=kind==='screen'||kind==='screenAudio';
+    const type=kind==='screen'?'video':kind==='screenAudio'?'audio':kind;
+    const transceiver=peer.pc.getTransceivers().filter(t=>t.receiver.track.kind===type)[display?1:0];
+    if(transceiver&&!transceiver.stopped)await transceiver.sender.replaceTrack(track);
+    else if(!display&&track&&peer.pc.remoteDescription)peer.pc.addTrack(track,media);
   }));
   const failed = results.filter(result => result.status === 'rejected');
   if (failed.length) {
     console.warn('Отправка медиадорожки:', failed.map(result => result.reason));
     $('call-note').textContent = 'Устройство включено, но передать его одному из участников не удалось. Попробуйте перезайти в комнату.';
+  }
+}
+function microphoneConstraints() {
+  const processing=$('mic-processing').checked!==false;
+  return {echoCancellation:processing,noiseSuppression:processing,autoGainControl:false};
+}
+async function recordMicTest() {
+  const current=session,button=$('mic-test'),sample=$('mic-test-audio');
+  if(!current)return;
+  if(typeof MediaRecorder==='undefined'||!navigator.mediaDevices?.getUserMedia) {
+    toast('Этот браузер не поддерживает тест микрофона.');
+    return;
+  }
+  button.disabled=true;
+  let track;
+  try {
+    sample.pause();
+    track=media.getAudioTracks().find(item=>item.readyState==='live'&&item.enabled)?.clone();
+    if(!track) {
+      const source=await navigator.mediaDevices.getUserMedia({audio:microphoneConstraints(),video:false});
+      track=source.getAudioTracks()[0];
+    }
+    if(session!==current)return;
+    micTestTrack=track;
+    const recorder=new MediaRecorder(new MediaStream([track]));
+    const chunks=[];
+    const recording=new Promise((resolve,reject)=>{
+      recorder.ondataavailable=event=>chunks.push(event.data);
+      recorder.onerror=()=>reject(new Error('Ошибка записи'));
+      recorder.onstop=()=>resolve(new Blob(chunks,{type:recorder.mimeType}));
+    });
+    recorder.start();
+    button.textContent='Запись 4 секунды…';
+    const timer=setTimeout(()=>{if(recorder.state!=='inactive')recorder.stop();},4000);
+    let audio;
+    try{audio=await recording;}finally{clearTimeout(timer);}
+    if(session!==current)return;
+    if(micTestUrl)URL.revokeObjectURL(micTestUrl);
+    micTestUrl=URL.createObjectURL(audio);
+    sample.src=micTestUrl;
+    sample.hidden=false;
+  } catch {
+    if(session===current)toast('Не удалось записать тест микрофона.');
+  } finally {
+    track?.stop();
+    if(micTestTrack===track)micTestTrack=null;
+    if(session===current) {
+      button.textContent='Записать тест микрофона';
+      button.disabled=false;
+    }
+  }
+}
+async function changeMicrophoneProcessing() {
+  const input=$('mic-processing');
+  const track=media.getAudioTracks().find(item=>item.readyState==='live');
+  if(!track)return;
+  const wasOn=track.enabled;
+  media.removeTrack(track);
+  track.stop();
+  updateDevices();
+  if(!wasOn)return;
+  input.disabled=true;
+  try {
+    await toggle('audio');
+  } finally {
+    input.disabled=!session;
   }
 }
 async function toggle(kind) {
@@ -557,7 +958,7 @@ async function toggle(kind) {
       let stream;
       try {
         stream = await navigator.mediaDevices.getUserMedia(kind === 'audio'
-          ? {audio:{echoCancellation:true,noiseSuppression:true},video:false}
+          ? {audio:microphoneConstraints(),video:false}
           : {audio:false,video:{width:{ideal:640},height:{ideal:360},frameRate:{ideal:20,max:30}}});
       } catch (error) {
         if (kind !== 'video' || error.name !== 'OverconstrainedError') throw error;
@@ -580,7 +981,136 @@ async function toggle(kind) {
   } finally { $(key).disabled = false; }
 }
 function updateDevices(){for(const [kind,key]of [['audio','mic'],['video','camera']]){const on=media.getTracks().some(t=>t.kind===kind&&t.enabled&&t.readyState==='live');$(key).classList.toggle('on',on);$(key).querySelector('i').textContent=on?'вкл.':'выкл.';$(key).setAttribute('aria-pressed',String(on));}attach(session.id,media);}
-function uploadFile(file){if(!host()||upload||!file)return;if(file.size>config.maxBytes){toast(`Максимальный размер — ${Math.round(config.maxBytes/1024**3)} ГБ`);return;}if(!file.size){toast('Файл пустой');return;}const xhr=new XMLHttpRequest();upload=xhr;access();$('upload-panel').hidden=false;$('upload-name').textContent=file.name;$('upload-progress').style.width='0%';$('upload-status').textContent='Загружаем видео в комнату…';xhr.open('POST',endpoint('upload'));xhr.setRequestHeader('Authorization','Bearer '+session.token);xhr.setRequestHeader('X-File-Name',encodeURIComponent(file.name));xhr.setRequestHeader('Content-Type','application/octet-stream');xhr.upload.onprogress=e=>{const percentage=Math.round(e.loaded/file.size*100);$('upload-progress').style.width=percentage+'%';$('upload-status').textContent=percentage===100?'Обрабатываем файл…':`Загружаем · ${percentage}%`;};xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300)toast('Видео готово. Можно начинать вечер!');else{let text='Не удалось загрузить видео';try{text=JSON.parse(xhr.responseText).error||text;}catch{}toast(text);}};xhr.onerror=()=>toast('Соединение прервалось. Попробуй загрузить файл заново.');xhr.onabort=()=>toast('Загрузка отменена');xhr.onloadend=()=>{upload=null;$('upload-panel').hidden=true;$('file').value='';access();};xhr.send(file);}
+function updateScreenButton() {
+  const button=$('share-screen');
+  button.classList.toggle('on',!!displayCapture);
+  button.setAttribute('aria-pressed',String(!!displayCapture));
+  button.lastElementChild.textContent=displayCapture?'Остановить показ':'Показать экран';
+}
+async function stopScreenShare() {
+  if(!displayCapture)return;
+  const capture=displayCapture;
+  displayCapture=null;
+  for(const track of capture.getTracks())track.stop();
+  updateScreenButton();
+  if(session)attachScreen(session.id,null);
+  await Promise.all([announceScreen(false),sendTrack('screen',null),sendTrack('screenAudio',null)]);
+}
+function announceScreen(screenActive) {
+  return Promise.allSettled([...peers.keys()].map(to=>command('signal',{to,signal:{screenActive}})));
+}
+async function toggleScreenShare() {
+  if(displayCapture){await stopScreenShare();return;}
+  const current=session,button=$('share-screen');
+  if(!current||!navigator.mediaDevices?.getDisplayMedia){
+    toast('Демонстрация экрана доступна в поддерживаемом браузере по HTTPS.');
+    return;
+  }
+  button.disabled=true;
+  try {
+    const capture=await navigator.mediaDevices.getDisplayMedia({
+      video:{width:{ideal:1280},frameRate:{ideal:20,max:30}},audio:true,
+      selfBrowserSurface:'exclude',systemAudio:'exclude'
+    });
+    const video=capture.getVideoTracks()[0];
+    if(session!==current||!video){for(const track of capture.getTracks())track.stop();return;}
+    const surface=video.getSettings().displaySurface;
+    if(surface&&surface!=='browser')for(const track of capture.getAudioTracks()){
+      capture.removeTrack(track);track.stop();
+    }
+    if('contentHint' in video)video.contentHint='detail';
+    displayCapture=capture;
+    video.addEventListener('ended',()=>{if(displayCapture===capture)stopScreenShare();},{once:true});
+    updateScreenButton();
+    attachScreen(current.id,capture);
+    focusedTile=screenCards.get(current.id)||null;
+    setCallView(true);
+    await Promise.all([announceScreen(true),sendTrack('screen',video),sendTrack('screenAudio',capture.getAudioTracks()[0]||null)]);
+  } catch(error) {
+    if(error.name!=='NotAllowedError')toast('Не удалось запустить демонстрацию экрана.');
+  } finally {button.disabled=!session;}
+}
+function getLibraryKey() {
+  const generated=[...crypto.getRandomValues(new Uint8Array(24))].map(byte=>byte.toString(16).padStart(2,'0')).join('');
+  try {
+    const saved=localStorage.getItem('together-library');
+    if(/^[a-f0-9]{48}$/.test(saved||''))return saved;
+    localStorage.setItem('together-library',generated);
+  }catch{}
+  return generated;
+}
+function fileSize(bytes) {
+  return bytes>=1024**3?(bytes/1024**3).toFixed(1)+' ГБ':Math.max(1,Math.round(bytes/1024**2))+' МБ';
+}
+async function openLibrary() {
+  if(!host()||!connected||upload||libraryBusy)return;
+  const current=session,list=$('library-list'),dialog=$('library');
+  list.replaceChildren();
+  $('library-status').textContent='Открываю библиотеку…';
+  dialog.showModal();
+  try {
+    const response=await fetch(endpoint('library'),{headers:{Authorization:'Bearer '+session.token,'X-Library-Key':libraryKey},signal:AbortSignal.timeout(5000)});
+    if(!response.ok)throw new Error();
+    const {videos}=await response.json();
+    if(session!==current||!dialog.open)return;
+    $('library-status').textContent=videos.length?'':'Здесь появятся файлы после первой загрузки.';
+    for(const video of videos) {
+      const button=document.createElement('button'),name=document.createElement('span'),size=document.createElement('small');
+      button.type='button';
+      button.className='library-video';
+      name.textContent=video.name;
+      size.textContent=fileSize(video.size);
+      button.append(name,size);
+      button.onclick=async()=>{
+        if(libraryBusy||session!==current||!host())return;
+        libraryBusy=true;
+        button.disabled=true;
+        $('library-upload').disabled=true;
+        try {
+          await command('select',{id:video.id});
+          if(dialog.open)dialog.close();
+        }catch(error){toast(error.message);}
+        finally{libraryBusy=false;button.disabled=false;$('library-upload').disabled=false;}
+      };
+      list.append(button);
+    }
+  } catch {
+    if(session===current)$('library-status').textContent='Не удалось открыть список сохранённых файлов.';
+  }
+}
+function uploadFile(file) {
+  if(!host()||!connected||upload||libraryBusy||!file)return;
+  if(file.size>config.maxBytes){toast(`Максимальный размер — ${Math.round(config.maxBytes/1024**3)} ГБ`);return;}
+  if(!file.size){toast('Файл пустой');return;}
+  const xhr=new XMLHttpRequest();
+  upload=xhr;
+  access();
+  $('upload-panel').hidden=false;
+  $('upload-name').textContent=file.name;
+  $('upload-progress').style.width='0%';
+  $('upload-status').textContent='Сохраняю видео…';
+  xhr.open('POST',endpoint('upload'));
+  xhr.setRequestHeader('Authorization','Bearer '+session.token);
+  xhr.setRequestHeader('X-Library-Key',libraryKey);
+  xhr.setRequestHeader('X-File-Name',encodeURIComponent(file.name));
+  xhr.setRequestHeader('Content-Type','application/octet-stream');
+  xhr.upload.onprogress=event=>{
+    if(!event.lengthComputable)return;
+    const percent=Math.round(event.loaded/event.total*100);
+    $('upload-progress').style.width=percent+'%';
+    $('upload-status').textContent=percent===100?'Сохраняю видео…':`Загрузка · ${percent}%`;
+  };
+  xhr.onload=()=>{
+    if(xhr.status>=200&&xhr.status<300){toast('Видео добавлено в библиотеку');return;}
+    let message='Не удалось загрузить видео';
+    try{message=JSON.parse(xhr.responseText).error||message;}catch{}
+    toast(message);
+  };
+  xhr.onerror=()=>toast('Соединение прервалось. Попробуй загрузить файл заново.');
+  xhr.onabort=()=>toast('Загрузка отменена');
+  xhr.onloadend=()=>{upload=null;$('upload-panel').hidden=true;$('file').value='';access();};
+  xhr.send(file);
+}
 $('diagnostics').ontoggle=async()=>{if($('diagnostics').open)$('diagnostics-output').value=await connectionReport();};
 $('copy-diagnostics').onclick=async()=>{const report=await connectionReport();$('diagnostics-output').value=report;try{await navigator.clipboard.writeText(report);toast('Диагностика скопирована. Отправь её в чат.');}catch{$('diagnostics-output').select();toast('Нажми Ctrl+C, чтобы скопировать отчёт');}};
 $('new-room').onclick=()=>{if(requestedRoom)forgetSession(requestedRoom);requestedRoom=null;history.replaceState(null,'','/');$('welcome-title').textContent='Твой вечер начинается здесь.';$('welcome-copy').textContent='Создай комнату и отправь друзьям новую ссылку.';$('join-button').textContent='Создать комнату ↗';$('new-room').hidden=true;};
@@ -588,24 +1118,179 @@ $('host-selector').onchange=()=>transferHost($('host-selector').value);
 $('leave-room').onclick=leaveRoom;
 $('join-form').onsubmit=enter;try{$('name').value=localStorage.getItem('together-name')||'';}catch{}
 if(requestedRoom){$('welcome-title').textContent='Тебя уже ждут.';$('welcome-copy').textContent='Зайди в комнату и устройтесь поудобнее. Фильм лучше смотреть вместе.';$('join-button').textContent='Присоединиться ↗';}$('welcome').addEventListener('cancel',e=>e.preventDefault());$('welcome').showModal();if(requestedRoom&&savedSession(requestedRoom))enter({preventDefault(){}});
-$('invite').onclick=async()=>{const link=location.origin+'/?room='+session.room;try{await navigator.clipboard.writeText(link);toast(location.hostname==='localhost'?'Ссылка скопирована. Друзьям нужен внешний адрес сервера вместо localhost.':'Ссылка скопирована. Отправь её друзьям!');}catch{prompt('Скопируй ссылку на комнату',link);}};
-$('pick').onclick=$('replace').onclick=()=>$('file').click();$('file').onchange=()=>uploadFile($('file').files[0]);$('cancel-upload').onclick=()=>upload?.abort();$('screen').ondragover=e=>e.preventDefault();$('screen').ondrop=e=>{e.preventDefault();uploadFile(e.dataTransfer.files[0]);};
-$('play').onclick=requestPlayPause;$('back').onclick=()=>seekTo(movie.currentTime-10);$('seek').onpointerdown=()=>{isScrubbing=host();};
+$('invite').onclick=async()=>{
+  const roomId=session?.room;
+  if(!roomId)return;
+  let address;
+  try{address=await fetch('/api/address',{signal:AbortSignal.timeout(5000)}).then(response=>response.json());}
+  catch{toast('Не удалось получить ссылку');return;}
+  if(session?.room!==roomId)return;
+  if(!address.url&&address.sharing){toast('Публичная ссылка пока недоступна. Проверь окно запуска.');return;}
+  const link=new URL('/',address.url||location.origin);
+  link.searchParams.set('room',roomId);
+  try {
+    await navigator.clipboard.writeText(link.href);
+    toast(!address.url&&['localhost','127.0.0.1'].includes(location.hostname)?
+      'Скопирована локальная ссылка. Для друзей через интернет запусти npm run share.':'Ссылка скопирована');
+  }catch{prompt('Скопируй ссылку на комнату',link.href);}
+};
+$('pick').onclick=$('replace').onclick=openLibrary;
+$('library-close').onclick=()=>$('library').close();
+$('library-upload').onclick=()=>{$('library').close();$('file').click();};
+$('file').onchange=()=>uploadFile($('file').files[0]);
+$('cancel-upload').onclick=()=>upload?.abort();
+$('screen').ondragover=event=>event.preventDefault();
+$('screen').ondrop=event=>{event.preventDefault();uploadFile(event.dataTransfer.files[0]);};
+
+$('play').onclick=requestPlayPause;
+$('back').onclick=()=>seekBy(-10);
+$('seek').onpointerdown=()=>{isScrubbing=host();};
 $('seek').oninput=()=>{isScrubbing=true;updateTime();};
-$('seek').onchange=()=>{const position=Number($('seek').value);isScrubbing=false;seekTo(position);};
-$('seek').onblur=()=>{isScrubbing=false;updateTime();};
-$('seek').onpointercancel=()=>{isScrubbing=false;updateTime();};
-window.addEventListener('pointerup',()=>{isScrubbing=false;});
-for(const event of ['play','pause','seeked','ended'])movie.addEventListener(event,()=>{if(host()&&movie.controls&&!bufferHolding){if(event==='play')playbackIntent=true;if(event==='pause'||event==='ended')playbackIntent=false;}if(event==='ended'){playbackIntent=false;bufferHolding=false;}updateTime();publish();});movie.addEventListener('timeupdate',updateTime);movie.addEventListener('loadedmetadata',()=>{updateTime();if(sourceResume){const resume=sourceResume;sourceResume=null;movie.currentTime=Math.min(resume.position,Math.max(0,(movie.duration||resume.position)-0.01));if(host()&&resume.shouldPlay){playbackIntent=true;bufferHolding=true;checkPlaybackBuffer();}else if(resume.shouldPlay)movie.play().catch(()=>{$('enable-play').hidden=false;});}else if(pending)apply(pending,true);});movie.addEventListener('error',()=>{if(version)toast('Браузер не смог открыть файл. Попробуй MP4 с кодеками H.264 + AAC или WebM.');});
-$('enable-play').onclick=()=>{autoplayBlocked=false;return movie.play().then(()=>{$('enable-play').hidden=true;for(const card of cards.values())card.querySelector('video').play().catch(()=>{});}).catch(()=>toast('Не удалось воспроизвести видео'));};
-$('mute').onclick=()=>{movie.muted=!movie.muted;$('mute').textContent=movie.muted?'⊘':'♪';};$('volume').oninput=()=>{movie.volume=Number($('volume').value);movie.muted=false;$('mute').textContent='♪';};$('fullscreen').onclick=async()=>{try{if(document.fullscreenElement)await document.exitFullscreen();else await $('player').requestFullscreen();}catch{toast('Полный экран недоступен в этом браузере');}};
-document.addEventListener('fullscreenchange',()=>{movie.controls=false;$('fullscreen').setAttribute('aria-label',document.fullscreenElement?'Выйти из полного экрана':'Полный экран');});
-$('continue-buffer').onclick=()=>{peerBufferOverride=true;checkPlaybackBuffer();};
-$('quality').onchange=()=>{qualityPreference=$('quality').value;useQuality(qualityPreference);};
-movie.ondblclick=()=>$('fullscreen').click();
-$('enable-audio').onclick=async()=>{const results=await Promise.allSettled([...cards.values()].flatMap(card=>[...card.querySelectorAll('audio')]).map(audio=>audio.play()));$('enable-audio').hidden=results.every(result=>result.status==='fulfilled');};
-$('mic').onclick=()=>toggle('audio');$('camera').onclick=()=>toggle('video');$('chat-form').onsubmit=async e=>{e.preventDefault();const input=$('chat-input'),text=input.value.trim();if(!text)return;input.value='';try{await command('chat',{text});}catch(error){input.value=text;toast(error.message);}};
-window.addEventListener('keydown',e=>{if(['INPUT','TEXTAREA','BUTTON'].includes(document.activeElement?.tagName)||$('welcome').open)return;if(e.code==='Space'&&host()&&version){e.preventDefault();$('play').click();}if(e.code==='ArrowRight'&&host()&&version)seekTo(movie.currentTime+10);if(e.code==='ArrowLeft'&&host()&&version)$('back').click();});
-window.addEventListener('beforeunload',()=>{if(!session)return;events?.close();for(const track of media.getTracks())track.stop();// Reload keeps the session; only the explicit Exit button removes membership.
+$('seek').onchange=()=>{
+  const position=Number($('seek').value);
+  isScrubbing=false;
+  seekTo(position);
+};
+function stopScrubbing(){if(isScrubbing){isScrubbing=false;updateTime();}}
+$('seek').onblur=stopScrubbing;
+$('seek').onpointercancel=stopScrubbing;
+window.addEventListener('pointerup',()=>setTimeout(stopScrubbing,0));
+
+const timeline=$('seek').parentElement,seekPreview=$('seek-preview');
+timeline.addEventListener('pointermove',event=>{
+  if(!version||!Number.isFinite(movie.duration)||movie.duration<=0)return;
+  const {left,width}=timeline.getBoundingClientRect();
+  if(width<=15)return;
+  const offset=Math.max(0,Math.min(width,event.clientX-left));
+  const ratio=Math.max(0,Math.min(1,(offset-7.5)/(width-15)));
+  seekPreview.textContent=time(ratio*movie.duration);
+  seekPreview.style.left=Math.max(25,Math.min(width-25,offset))+'px';
+  seekPreview.hidden=false;
 });
-setInterval(()=>{if(!room||!version)return;if(host()&&!movie.paused)publish();else if(!host()&&connected&&pending)apply(pending);},4000);
+timeline.addEventListener('pointerleave',()=>{seekPreview.hidden=true;});
+
+movie.addEventListener('timeupdate',updateTime);
+movie.addEventListener('loadedmetadata',()=>{
+  sourceLoading=false;
+  sourceFailed=false;
+  syncPlayback(true);
+  updateBufferDisplay();
+  scheduleWatch();
+});
+movie.addEventListener('error',()=>{
+  if(!version||!currentStream||streamPlayer)return;
+  sourceLoading=false;
+  sourceFailed=true;
+  const source=mediaSource;
+  useQuality(qualityPreference,true);
+  if(mediaSource===source&&movie.error?.code===MediaError.MEDIA_ERR_NETWORK)retryMedia();
+  updateBufferDisplay();
+  scheduleWatch();
+});
+movie.addEventListener('loadeddata',()=>{mediaRetryCount=0;});
+movie.addEventListener('ended',()=>{
+  if(movie.ended&&!pendingSeek&&room?.playback.phase==='playing')writePlayback('ended',movie.duration,room.playback.sequence);
+  scheduleWatch();
+});
+for(const event of ['play','pause','waiting','playing','seeking','seeked','canplay','progress'])movie.addEventListener(event,()=>{
+  if(event==='pause'&&connected&&!sourceLoading&&!unlocking&&!movie.ended&&
+    room?.playback.phase==='playing'&&serverNow()>=room.playback.at)heldPlayback=room.playback;
+  if(event==='waiting')mediaWaiting=true;
+  if(event==='playing'||(event==='canplay'||event==='seeked')&&movie.readyState>=3)mediaWaiting=false;
+  if(event==='playing'&&room?.playback.phase==='playing'&&!unlocking)playedVersion=version;
+  if(event==='seeked'||event==='canplay')syncPlayback();
+  updateBufferDisplay();
+  scheduleWatch();
+});
+$('enable-play').onclick=async()=>{
+  if(unlocking)return;
+  unlocking=true;
+  try {
+    await movie.play();
+    autoplayBlocked=false;
+  }catch{toast('Не удалось включить просмотр');}
+  finally {
+    unlocking=false;
+    syncPlayback();
+    updateBufferDisplay();
+    scheduleWatch();
+  }
+};
+$('mute').onclick=()=>{movie.muted=!movie.muted;$('mute').textContent=movie.muted?'⊘':'♪';};
+$('volume').oninput=()=>{movie.volume=Number($('volume').value);movie.muted=false;$('mute').textContent='♪';};
+$('quality').onchange=()=>{qualityPreference=$('quality').value;useQuality(qualityPreference);};
+
+const player=$('player'),controls=player.querySelector('.controls');
+function fullscreen(){return document.fullscreenElement===player||player.classList.contains('fullscreen-fallback');}
+function hideFullscreenControls() {
+  if(!fullscreen()||isScrubbing||controls.querySelector(':focus-visible'))return;
+  player.classList.add('idle-controls');
+  seekPreview.hidden=true;
+}
+function showFullscreenControls() {
+  clearTimeout(fullscreenTimer);
+  player.classList.remove('idle-controls');
+  if(fullscreen())fullscreenTimer=setTimeout(hideFullscreenControls,2200);
+}
+function fullscreenChanged() {
+  showFullscreenControls();
+  $('fullscreen').setAttribute('aria-label',fullscreen()?'Выйти из полного экрана':'Полный экран');
+}
+$('fullscreen').onclick=async()=>{
+  if(player.classList.contains('fullscreen-fallback')) {
+    player.classList.remove('fullscreen-fallback');
+    document.body.classList.remove('fullscreen-open');
+    fullscreenChanged();
+    return;
+  }
+  try {
+    if(document.fullscreenElement===player)await document.exitFullscreen();
+    else await player.requestFullscreen();
+  }catch {
+    player.classList.add('fullscreen-fallback');
+    document.body.classList.add('fullscreen-open');
+    fullscreenChanged();
+  }
+};
+document.addEventListener('fullscreenchange',fullscreenChanged);
+player.addEventListener('pointermove',event=>{
+  if(!fullscreen()||event.pointerType==='touch')return;
+  const bottom=player.getBoundingClientRect().bottom;
+  if(event.clientY>=bottom-115||!player.classList.contains('idle-controls'))showFullscreenControls();
+});
+player.addEventListener('pointerdown',event=>{
+  if(fullscreen()&&(event.pointerType==='touch'||controls.contains(event.target)))showFullscreenControls();
+});
+controls.addEventListener('focusout',()=>{if(fullscreen())showFullscreenControls();});
+movie.ondblclick=()=>$('fullscreen').click();
+$('enable-audio').onclick=async()=>{const results=await Promise.allSettled([...cards.values(),...screenCards.values()].flatMap(card=>[...card.querySelectorAll('audio')]).map(audio=>audio.play()));$('enable-audio').hidden=results.every(result=>result.status==='fulfilled');};
+$('mic-test').onclick=recordMicTest;
+$('mic-processing').onchange=changeMicrophoneProcessing;
+$('mute-call').onclick=()=>setCallMuted(!callMuted);
+$('movie-mode').onclick=()=>setCallView(false);
+$('call-mode').onclick=()=>setCallView(true);
+$('call-focus').onchange=event=>{
+  focusedTile=event.target.value===''?null:[...cards.values(),...screenCards.values()][Number(event.target.value)]||null;
+  renderCallLayout();
+};
+$('share-screen').onclick=toggleScreenShare;
+$('mic').onclick=()=>toggle('audio');$('camera').onclick=()=>toggle('video');$('chat-form').onsubmit=async e=>{e.preventDefault();const input=$('chat-input'),text=input.value.trim();if(!text)return;input.value='';try{await command('chat',{text});}catch(error){input.value=text;toast(error.message);}};
+window.addEventListener('keydown',event=>{
+  if(fullscreen()) {
+    showFullscreenControls();
+    if(event.key==='Escape'&&player.classList.contains('fullscreen-fallback'))$('fullscreen').click();
+  }
+  if(['INPUT','TEXTAREA','BUTTON','SELECT'].includes(document.activeElement?.tagName)||document.querySelector('dialog[open]'))return;
+  if(event.code==='Space'&&host()&&version){event.preventDefault();requestPlayPause();}
+  if(event.code==='ArrowRight'&&host()&&version){event.preventDefault();seekBy(10);}
+  if(event.code==='ArrowLeft'&&host()&&version){event.preventDefault();seekTo(movie.currentTime-10);}
+});
+window.addEventListener('beforeunload',()=>{
+  events?.close();
+  for(const track of [...media.getTracks(),...(displayCapture?.getTracks()||[])])track.stop();
+});
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden&&connected){syncPlayback();scheduleWatch();}
+});
+setInterval(()=>{if(events&&Date.now()-lastRoomEvent>12000)reconnect('heartbeat_timeout');if(version){syncPlayback();updateBufferDisplay();}},1000);
+setInterval(()=>{if(connected)syncClock();},60000);

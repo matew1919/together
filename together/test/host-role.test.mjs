@@ -7,11 +7,13 @@ import path from 'node:path';
 const source=await readFile(new URL('../public/app.js',import.meta.url),'utf8');
 const role=source.slice(source.indexOf('function updateHostRole('),source.indexOf('function renderHostSelector('));
 const access=source.slice(source.indexOf('function access()'),source.indexOf('function state('));
-test('новый ведущий получает кнопки управления и сбрасывает старое ожидание',()=>{
- const nodes=new Map(),c={room:{host:'matvey',playback:{paused:true}},session:{id:'matvey'},version:'v1',connected:true,upload:null,playbackRevision:0,bufferHolding:true,bufferChecking:true,bufferPausePosition:100,peerBufferOverride:true,autoplayBlocked:true,playbackIntent:true,sourceResume:{shouldPlay:true},toast(){},$:id=>{if(!nodes.has(id))nodes.set(id,{});return nodes.get(id);}};c.host=()=>c.room.host===c.session.id;vm.createContext(c);vm.runInContext(role+access,c);
- c.updateHostRole('ilsur');c.access();assert.equal(c.bufferHolding,false);assert.equal(c.bufferChecking,false);assert.equal(c.bufferPausePosition,null);assert.equal(c.autoplayBlocked,false);
+test('только ведущий получает кнопки управления и выбора видео',()=>{
+ const nodes=new Map(),c={room:{host:'matvey'},session:{id:'matvey'},version:'v1',connected:true,upload:null,toast(){},$:id=>{if(!nodes.has(id))nodes.set(id,{});return nodes.get(id);}};
+ c.host=()=>c.room.host===c.session.id;vm.createContext(c);vm.runInContext(role+access,c);
+ c.updateHostRole('ilsur');c.access();
  for(const id of ['play','seek','back','pick','replace'])assert.equal(nodes.get(id).disabled,false,id);
- c.session.id='ilsur';c.access();for(const id of ['play','seek','back','pick','replace'])assert.equal(nodes.get(id).disabled,true,id);
+ c.session.id='ilsur';c.access();
+ for(const id of ['play','seek','back','pick','replace'])assert.equal(nodes.get(id).disabled,true,id);
 });
 test('Матвей после передачи может управлять плеером, загрузкой и ведущим',async()=>{
  const directory=await mkdtemp(path.join(os.tmpdir(),'together-host-'));process.env.DATA_DIR=directory;

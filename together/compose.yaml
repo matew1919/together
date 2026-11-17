@@ -3,12 +3,13 @@ services:
     build: .
     restart: unless-stopped
     environment:
+      PUBLIC_URL: https://${DOMAIN:?Set DOMAIN in .env}
       MAX_VIDEO_GB: ${MAX_VIDEO_GB:-8}
       ICE_SERVERS: ${ICE_SERVERS:-}
     volumes:
       - videos:/app/.data
   proxy:
-    image: caddy:2-alpine
+    image: caddy:2.11-alpine
     restart: unless-stopped
     environment:
       DOMAIN: ${DOMAIN:?Set DOMAIN in .env}
@@ -16,7 +17,7 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./${CADDYFILE:-Caddyfile}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:

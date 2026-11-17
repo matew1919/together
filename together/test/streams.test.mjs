@@ -17,7 +17,7 @@ test('реальный MP4 превращается в HLS с оригинало
    const playlist=await streamAsset(video,quality,'index.m3u8');assert.ok(playlist);
    const text=await readFile(playlist.path,'utf8');assert.match(text,/#EXT-X-ENDLIST/);assert.match(text,/#EXT-X-MAP:URI="init.mp4"/);
    const rewritten=authenticatedPlaylist(text,'test-token');assert.match(rewritten,/init.mp4\?token=test-token/);assert.match(rewritten,/part-\d+.m4s\?token=test-token/);
-   const init=await streamAsset(video,quality,'init.mp4');assert.ok(init.size>0);const part=await streamAsset(video,quality,'part-000000.m4s');assert.ok(part.size>0);
+   const init=await streamAsset(video,quality,'init.mp4');assert.ok(init.size>0);const part=await streamAsset(video,quality,'part-000000.m4s');assert.ok(part.size>24);
   }
   assert.equal(await streamAsset(video,'360','../../server.mjs'),null);assert.equal(await streamAsset(video,'720','index.m3u8'),null);
  }finally{await cancelStreams(video);await rm(dir,{recursive:true,force:true});}

@@ -1,6 +1,6 @@
 import {readFile} from 'node:fs/promises';
 import path from 'node:path';
-const stun=[{urls:'stun:stun.l.google.com:19302'}];
+const stun=[{urls:['stun:stun.l.google.com:19302','stun:stun.cloudflare.com:3478','stun:stun1.l.google.com:19302']}];
 let cached=null;
 export function validateIceServers(value){
   if(!Array.isArray(value)||!value.length||value.length>20)throw new Error('Некорректный список ICE-серверов');

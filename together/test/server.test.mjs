@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,rm} from 'node:fs/promises';
+import {mkdtemp,readFile,readdir,rm} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 const temp=await mkdtemp(path.join(os.tmpdir(),'together-test-'));
@@ -16,6 +16,7 @@ test('комната, доступы, события, видео и переда
   const joined=await request(prefix+'/join',{name:'Друг'});assert.equal(joined.status,200);const friend=joined.data;
   const open=async member=>{const controller=new AbortController();streams.push(controller);const response=await fetch(base+prefix+'/events?token='+member.token,{signal:controller.signal});const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';return async type=>{const timeout=setTimeout(()=>controller.abort(),5000);try{while(true){const index=buffer.indexOf('\n\n');if(index>=0){const block=buffer.slice(0,index);buffer=buffer.slice(index+2);if(block.startsWith('event: '+type+'\n'))return JSON.parse(block.split('\ndata: ')[1]);}else{const {value,done}=await reader.read();if(done)throw new Error('SSE closed');buffer+=decoder.decode(value,{stream:true});}}}finally{clearTimeout(timeout);}};};
   try{
+    await open(owner);
     const next=await open(friend),initial=await next('state');assert.equal(initial.members.length,2);assert.equal(initial.host,owner.id);
     assert.equal((await request(prefix+'/playback',{position:1,paused:false},friend)).status,403);
     assert.equal((await fetch(base+prefix+'/video')).status,401);
@@ -27,7 +28,21 @@ test('комната, доступы, события, видео и переда
     const range=await fetch(videoUrl,{headers:{Range:'bytes=2-7'}});assert.equal(range.status,206);assert.equal(range.headers.get('content-range'),`bytes 2-7/${payload.length}`);assert.equal(await range.text(),payload.subarray(2,8).toString());
     assert.equal((await fetch(videoUrl,{headers:{Range:'bytes=999-'}})).status,416);
     const suffix=await fetch(videoUrl,{headers:{Range:'bytes=-4'}});assert.equal(await suffix.text(),payload.subarray(-4).toString());
-    const playback=await request(prefix+'/playback',{position:12,paused:false,version:v},owner);assert.equal(playback.status,200);const played=await next('playback');assert.equal(played.position,12);assert.equal(played.paused,false);
+    const playback=await request(prefix+'/playback',{action:'play',position:12,version:v},owner);
+    assert.equal(playback.status,200);
+    const buffering=await next('playback');
+    assert.equal(buffering.phase,'buffering');
+    const report={version:v,sequence:buffering.sequence,position:12,duration:50,paused:true,waiting:false,blocked:false,bufferAhead:10};
+    assert.equal((await request(prefix+'/watch',report,owner)).status,200);
+    assert.equal((await request(prefix+'/watch',report,friend)).status,200);
+    const played=await next('playback');
+    assert.equal(played.position,12);
+    assert.equal(played.phase,'playing');
+    assert.equal(played.paused,false);
+    const missed=await request(prefix+'/watch',report,friend);
+    assert.equal(missed.data.playback.sequence,played.sequence);
+    assert.equal(missed.data.playback.position,12);
+    await request(prefix+'/clientevent',{reason:'watch_502'},friend);
     assert.equal((await request(prefix+'/playback',{position:1,paused:true,version:'stale'},owner)).status,409);
     await request(prefix+'/chat',{text:'<script>test</script>'},friend);const message=await next('chat');assert.equal(message.text,'<script>test</script>');assert.equal(message.name,'Друг');
     assert.equal((await request(prefix+'/host',{id:friend.id},friend)).status,403);
@@ -39,5 +54,14 @@ test('комната, доступы, события, видео и переда
     const wrongOrigin=await fetch(base+'/api/rooms',{method:'POST',headers:{Origin:'https://example.com','Content-Type':'application/json'},body:'{}'});assert.equal(wrongOrigin.status,403);
     const full=await fetch(videoUrl);assert.equal(full.status,401);
     await request(prefix+'/leave',{},owner);
+    const logDir=path.join(temp,'logs');
+    const raw=(await Promise.all((await readdir(logDir)).map(file=>readFile(path.join(logDir,file),'utf8')))).join('');
+    const entries=raw.trim().split('\n').map(JSON.parse);
+    assert.ok(entries.some(item=>item.event==='events_connected'&&item.member===friend.id));
+    assert.ok(entries.some(item=>item.event==='client_reconnected'&&item.reason==='watch_502'));
+    assert.ok(entries.some(item=>item.event==='member_left'&&item.member===friend.id));
+    assert.ok(entries.some(item=>item.event==='http'&&item.status===401));
+    assert.equal(raw.includes(friend.token),false);
+    assert.equal(raw.includes('<script>test</script>'),false);
   }finally{for(const controller of streams)controller.abort();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await rm(temp,{recursive:true,force:true});}
 });

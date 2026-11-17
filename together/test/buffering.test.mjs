@@ -2,16 +2,116 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {readFile} from 'node:fs/promises';
-const source=await readFile(new URL('../public/app.js',import.meta.url),'utf8');
-const policy=source.slice(source.indexOf('function bufferedAhead('),source.indexOf('function updateBufferDisplay('));
-const controller=source.slice(source.indexOf('async function holdForBuffer('),source.indexOf('async function requestPlayPause('));
-function ranges(values){return {length:values.length,start:i=>values[i][0],end:i=>values[i][1]};}
-function setup(){const nodes=new Map();const movie={currentTime:20,duration:100,readyState:4,seeking:false,paused:true,buffered:ranges([[0,30]]),pause(){this.paused=true;},async play(){this.paused=false;}};const sent=[];const context={movie,version:'v1',room:{members:[{id:'self'},{id:'friend'}]},session:{id:'self'},connected:true,playbackIntent:true,bufferHolding:true,bufferChecking:false,autoplayBlocked:false,playbackRevision:0,bufferPausePosition:null,peerBufferOverride:false,time:s=>String(Math.floor(s||0)),watchPositions:new Map(),writePlayback:async(position,paused)=>sent.push({action:'playback',payload:{position,paused,version:'v1'}}),host:()=>true,updateBufferDisplay(){},shareWatchPosition(){},toast(){},command:async(action,payload)=>sent.push({action,payload}),$:id=>{if(!nodes.has(id))nodes.set(id,{});return nodes.get(id);}};vm.createContext(context);vm.runInContext(policy+controller,context);return {context,movie,sent};}
-test('буфер учитывает только непрерывно загруженные данные около позиции',()=>{const {context,movie}=setup();movie.buffered=ranges([[0,22],[40,80]]);assert.equal(context.bufferedAhead(movie),2);assert.equal(context.bufferReady(movie),false);movie.buffered=ranges([[0,22],[22.1,29]]);assert.equal(context.bufferedAhead(movie),9);assert.equal(context.bufferReady(movie),true);});
-test('в конце короткого остатка не требуется ждать несуществующие пять секунд',()=>{const {context,movie}=setup();movie.currentTime=98;movie.buffered=ranges([[90,100]]);assert.equal(context.bufferReady(movie),true);movie.seeking=true;assert.equal(context.bufferReady(movie),false);});
-test('общий просмотр ждёт буфера друга и продолжает после готовности',async()=>{const f=setup();await f.context.checkPlaybackBuffer();assert.equal(f.movie.paused,true);assert.equal(f.context.bufferHolding,true);f.context.watchPositions.set('friend',{version:'v1',position:20,readyToPlay:true,bufferAhead:8,waiting:false,receivedAt:Date.now()});await f.context.checkPlaybackBuffer();assert.equal(f.movie.paused,false);assert.equal(f.context.bufferHolding,false);assert.equal(f.sent.at(-1).payload.paused,false);});
-test('при обычном проигрывании запас ниже пяти секунд не вызывает лишнюю паузу',async()=>{const f=setup();f.movie.paused=false;f.context.bufferHolding=false;f.movie.buffered=ranges([[0,22]]);f.context.watchPositions.set('friend',{version:'v1',position:20,readyToPlay:false,bufferAhead:2,waiting:false,receivedAt:Date.now()});await f.context.checkPlaybackBuffer();assert.equal(f.movie.paused,false);assert.equal(f.context.bufferHolding,false);});
-test('загрузка у друга ставит общую паузу, устаревшие данные не запускают фильм',async()=>{const f=setup();f.movie.paused=false;f.context.bufferHolding=false;f.context.watchPositions.set('friend',{version:'v1',position:20,readyToPlay:false,bufferAhead:0,waiting:true,receivedAt:Date.now()});await f.context.checkPlaybackBuffer();assert.equal(f.movie.paused,true);assert.equal(f.sent.at(-1).payload.paused,true);f.context.watchPositions.set('friend',{version:'v1',position:20,readyToPlay:true,bufferAhead:10,receivedAt:Date.now()-20000});await f.context.checkPlaybackBuffer();assert.equal(f.movie.paused,true);});
+import {playbackPosition,setPlayback,updateGroupPlayback} from '../playback.mjs';
 
-test('повторная перемотка во время ожидания обновляет общую позицию',async()=>{const f=setup();await f.context.holdForBuffer();assert.equal(f.sent.at(-1).payload.position,20);f.movie.currentTime=5;await f.context.holdForBuffer();assert.equal(f.sent.at(-1).payload.position,5);assert.equal(f.sent.at(-1).payload.paused,true);});
-test('большой местный буфер не скрывает имя друга с нехваткой данных',()=>{const f=setup();f.context.room.members[1].name='Матвей';f.context.watchPositions.set('friend',{version:'v1',position:20,readyToPlay:false,bufferAhead:0,waiting:true,receivedAt:Date.now()});const waiters=f.context.bufferWaiters();assert.equal(waiters.length,1);assert.equal(waiters[0].name,'Матвей');assert.match(waiters[0].reason,/буфер/);});
+const source=await readFile(new URL('../public/app.js',import.meta.url),'utf8');
+
+function setup() {
+  const host={stream:true},friend={stream:true};
+  const room={host:'host',members:new Map([['host',host],['friend',friend]])};
+  setPlayback(room,'buffering',20,1000);
+  function report(member,changes={}) {
+    member.watch={sequence:room.playback.sequence,position:room.playback.position,duration:100,
+      at:1000,bufferAhead:8,paused:true,blocked:false,waiting:false,...changes};
+  }
+  return {room,host,friend,report};
+}
+
+test('считаются только непрерывные загруженные данные вокруг текущей позиции',()=>{
+  const values=[[0,22],[40,80]];
+  const c=vm.createContext({movie:{currentTime:20,buffered:{length:2,start:i=>values[i][0],end:i=>values[i][1]}}});
+  vm.runInContext(source.slice(source.indexOf('function bufferedAhead('),source.indexOf('function localTime(')),c);
+  assert.equal(c.bufferedAhead(c.movie),2);
+  values[1]=[22.1,29];
+  assert.equal(c.bufferedAhead(c.movie),9);
+});
+
+test('старт ждёт всех подключённых зрителей и планируется на одно серверное время',()=>{
+  const {room,host,friend,report}=setup();
+  report(host);
+  report(friend,{bufferAhead:2});
+  assert.equal(updateGroupPlayback(room,1000),false);
+  report(friend);
+  assert.equal(updateGroupPlayback(room,1100),true);
+  assert.equal(room.playback.phase,'playing');
+  assert.ok(room.playback.at>1100);
+  assert.equal(playbackPosition(room.playback,1100),20);
+  assert.equal(playbackPosition(room.playback,room.playback.at+2000),22);
+});
+
+test('при небольшом запасе фильм идёт, при остановке у друга комната ждёт',()=>{
+  const {room,host,friend,report}=setup();
+  setPlayback(room,'playing',20,1000);
+  report(host,{position:22,paused:false,at:3650});
+  report(friend,{position:22,paused:false,at:3650,bufferAhead:2});
+  assert.equal(updateGroupPlayback(room,3650),false);
+  report(friend,{position:21.8,paused:false,at:3650,waiting:true,bufferAhead:0});
+  assert.equal(updateGroupPlayback(room,3650),true);
+  assert.equal(room.playback.phase,'buffering');
+  assert.equal(room.playback.position,21.8);
+});
+
+test('повторная перемотка ждёт отчёты для новой позиции, даже если предыдущий отчёт был свежим',()=>{
+  const {room,host,friend,report}=setup();
+  report(friend);
+  setPlayback(room,'buffering',91,1100);
+  report(host,{at:1200});
+  assert.equal(updateGroupPlayback(room,1200),false);
+  report(friend,{position:20,at:1200});
+  assert.equal(updateGroupPlayback(room,1200),false);
+  report(friend,{at:1200});
+  assert.equal(updateGroupPlayback(room,1200),true);
+});
+
+test('в конце учитывается оставшееся время, а вышедший зритель не блокирует просмотр',()=>{
+  const {room,host,friend,report}=setup();
+  friend.stream=null;
+  setPlayback(room,'buffering',98,1000);
+  report(host,{bufferAhead:2});
+  assert.equal(updateGroupPlayback(room,1000),true);
+});
+
+test('комната ждёт, пока зритель разрешит воспроизведение в браузере',()=>{
+  const {room,host,friend,report}=setup();
+  report(host);
+  report(friend,{blocked:true});
+  assert.equal(updateGroupPlayback(room,1200),false);
+  report(friend);
+  assert.equal(updateGroupPlayback(room,1200),true);
+});
+
+test('пауза у зрителя ставит на ожидание всю комнату',()=>{
+  const {room,host,friend,report}=setup();
+  setPlayback(room,'playing',20,1000);
+  report(host,{position:23,paused:false,at:4650});
+  report(friend,{position:22.8,paused:true,at:4650});
+  assert.equal(updateGroupPlayback(room,4650),true);
+  assert.equal(room.playback.phase,'buffering');
+  assert.equal(room.playback.position,22.8);
+});
+
+test('обрыв у зрителя удерживает комнату до нового отчёта после переподключения',()=>{
+  const {room,host,friend,report}=setup();
+  setPlayback(room,'playing',20,1000);
+  friend.present=true;
+  friend.stream=null;
+  assert.equal(updateGroupPlayback(room,3000),true);
+  report(host,{at:3000});
+  report(friend,{at:3000});
+  assert.equal(updateGroupPlayback(room,3000),false);
+  friend.stream=true;
+  friend.watch=null;
+  assert.equal(updateGroupPlayback(room,3100),false);
+  report(friend,{at:3200});
+  assert.equal(updateGroupPlayback(room,3200),true);
+});
+
+test('комната ждёт зрителя, переставшего отправлять отчёты при открытом канале',()=>{
+  const {room,host,friend,report}=setup();
+  setPlayback(room,'playing',20,1000);
+  report(host,{position:27,paused:false,at:8650});
+  report(friend,{position:21,paused:false,at:2650});
+  assert.equal(updateGroupPlayback(room,8650),true);
+  assert.equal(room.playback.phase,'buffering');
+  assert.equal(room.playback.position,21);
+});

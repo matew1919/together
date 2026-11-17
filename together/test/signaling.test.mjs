@@ -11,10 +11,10 @@ class Peer {
   addTransceiver(kind){this.transceivers.push({receiver:{track:{kind}},sender:{async replaceTrack(){},setStreams(){}}});}
   getTransceivers(){return this.transceivers;}
   async setLocalDescription(){this.localDescription={type:this.remoteDescription?.type==='offer'?'answer':'offer',sdp:'test'};this.signalingState=this.localDescription.type==='offer'?'have-local-offer':'stable';}
-  async setRemoteDescription(value){assert.equal(this.busy,undefined,'remote descriptions must not overlap');this.busy=true;await delay(5);this.remoteDescription=value;this.signalingState=value.type==='offer'?'have-remote-offer':'stable';if(value.type==='offer'&&!this.transceivers.length){this.addTransceiver('audio');this.addTransceiver('video');}delete this.busy;}
+  async setRemoteDescription(value){assert.equal(this.busy,undefined,'remote descriptions must not overlap');this.busy=true;await delay(5);this.remoteDescription=value;this.signalingState=value.type==='offer'?'have-remote-offer':'stable';if(value.type==='offer'&&!this.transceivers.length){for(const kind of ['audio','video','video','audio'])this.addTransceiver(kind);}delete this.busy;}
   async addIceCandidate(candidate){assert.equal(this.busy,undefined,'ICE must wait for remote description');assert.ok(this.remoteDescription);this.candidates.push(candidate);}
 }
-function client(id,deliver){const context={session:{id},config:{iceServers:[]},peers:new Map(),media:new Stream(),MediaStream:Stream,RTCPeerConnection:Peer,console,setInterval(){},refreshPeerStatus(){},attach(){},command:async(action,payload)=>{deliver(id,payload);}};vm.createContext(context);vm.runInContext(rtc,context);return context;}
+function client(id,deliver){const context={session:{id},config:{iceServers:[]},peers:new Map(),displayCapture:null,media:new Stream(),MediaStream:Stream,RTCPeerConnection:Peer,console,setInterval(){},refreshPeerStatus(){},attach(){},command:async(action,payload)=>{deliver(id,payload);}};vm.createContext(context);vm.runInContext(rtc,context);return context;}
 test('потерянное сообщение до подключения друга не мешает согласованию',async()=>{
  const contexts={},pending=[],sent=[];let error;
  const deliver=(from,{to,signal})=>{sent.push({from,to,signal});if(!contexts[to])return;queueMicrotask(()=>{const promise=contexts[to].signal(from,signal).catch(e=>{error=e;});pending.push(promise);});};
@@ -27,7 +27,7 @@ test('потерянное сообщение до подключения дру
  await Promise.all(pending);if(error)throw error;
  assert.equal(sent.filter(message=>message.signal.description?.type==='offer').length,1);
  assert.equal(contexts.a.peers.get('b').pc.remoteDescription.type,'answer');
- assert.equal(contexts.b.peers.get('a').pc.getTransceivers().length,2);
+ assert.equal(contexts.b.peers.get('a').pc.getTransceivers().length,4);
 });
 test('кандидат ICE ждёт завершения установки удалённого описания',async()=>{
  const c=client('z',()=>{});const p=c.makePeer('a');
